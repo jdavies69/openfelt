@@ -88,7 +88,7 @@ pub fn map_policy_action(
         PolicyActionV1::BetRaiseThreeQuarterPot => map_fraction(observation, policy_action, 3, 4),
         PolicyActionV1::BetRaisePot => map_fraction(observation, policy_action, 1, 1),
         PolicyActionV1::BetRaiseOneAndHalfPot => map_fraction(observation, policy_action, 3, 2),
-        PolicyActionV1::AllIn if legal.all_in_to > contribution => {
+        PolicyActionV1::AllIn if legal.all_in_to > contribution && legal.can_all_in() => {
             Ok(Action::AllIn(legal.all_in_to))
         }
         _ => Err(PolicyActionError::Masked(policy_action)),
@@ -116,7 +116,7 @@ fn map_fraction(
             observation.current_wager.saturating_add(increment),
             false,
         )
-    } else if legal.all_in_to > contribution {
+    } else if legal.all_in_to > contribution && legal.can_all_in() {
         return Ok(Action::AllIn(legal.all_in_to));
     } else {
         return Err(PolicyActionError::Masked(policy_action));

@@ -40,6 +40,11 @@ jobs:
       - name: Test
         run: cargo test --locked --all-targets --all-features
       - name: Build player client and dedicated server
-        run: cargo build --locked --release --bin sneakyblinders --bin poker-server
+        run: cargo build --locked --release --bin openfelt --bin sneakyblinders --bin poker-server
       - name: Check player launch command
         run: cargo run --locked --release --bin sneakyblinders -- --version
+      - name: Check OpenFelt launch command
+        run: cargo run --locked --release --bin openfelt -- --help
+      - name: Exercise OpenFelt in a terminal
+        if: runner.os != 'Windows'
+        run: python3 scripts/test_openfelt_pty.py target/release/openfelt

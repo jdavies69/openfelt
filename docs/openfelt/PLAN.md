@@ -8,3 +8,7 @@
 6. Verify the complete terminal flow, add reproducible tests and public installation guidance. Additional native Anthropic, compatible-service and local-model adapters remain subsequent milestones until their contracts are tested.
 
 The smallest first increment is steps 1–2 with deterministic local teaching and no network access.
+
+## Implementation status
+
+Steps 1–5 are now implemented, including a standalone local trainer, policy profiles, paused teaching, cash ledger and optional OpenAI Responses adapter. Step 6 has local automated/PTY coverage, public setup documentation and the CI matrix. See [actual validation and limits](VALIDATION.md). Live paid coaching evaluation and additional provider adapters remain separate future work; no unsupported provider is advertised as available.

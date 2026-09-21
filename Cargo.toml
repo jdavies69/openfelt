@@ -2,12 +2,13 @@
 name = "terminal-poker"
 version = "1.0.1"
 edition = "2021"
-description = "Heads-up No-Limit Texas Hold'em poker for the terminal"
+description = "OpenFelt: local play-money Hold'em learning with optional bring-your-own-key coaching"
 license = "MIT"
-repository = "https://github.com/ashxudev/terminal-poker"
+repository = "https://github.com/jdavies69/openfelt"
 keywords = ["poker", "terminal", "tui", "game", "training"]
 categories = ["games", "command-line-utilities"]
-homepage = "https://github.com/ashxudev/terminal-poker"
+homepage = "https://github.com/jdavies69/openfelt"
+publish = false
 default-run = "poker"
 
 # Both binaries use the same source - users can run `terminal-poker` or `poker`
@@ -84,6 +85,8 @@ name = "review-sprint16"
 path = "src/bin/review_sprint16.rs"
 
 [dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt", "time", "sync", "macros", "net"] }
 argon2 = { version = "=0.5.3", default-features = false, features = ["alloc"] }
 ratatui = "0.30.2"
 ratatui-image = { version = "=11.0.8", default-features = false, features = ["crossterm"] }

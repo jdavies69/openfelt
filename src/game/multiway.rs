@@ -100,6 +100,13 @@ pub struct MultiwayLegalActions {
     pub raise_reopened: bool,
 }
 
+impl MultiwayLegalActions {
+    /// An all-in either raises with reopened action or is an exact/short call.
+    pub fn can_all_in(&self) -> bool {
+        self.raise_reopened || (!self.can_check && self.call_amount.is_none())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MultiwayActionRecord {
     pub sequence: u32,
@@ -572,13 +579,16 @@ impl MultiwayHand {
         let raise_reopened = self.raise_reopened_for(seat);
         let maximum_non_all_in = all_in_to.saturating_sub(1);
 
-        let min_bet_to =
-            (to_call == 0 && other_live && maximum_non_all_in >= self.blind_values.big_blind)
-                .then_some(self.blind_values.big_blind);
+        let min_bet_to = (self.current_wager == 0
+            && other_live
+            && maximum_non_all_in >= self.blind_values.big_blind)
+            .then_some(self.blind_values.big_blind);
         let minimum_raise = self.current_wager.saturating_add(self.last_full_raise_size);
-        let min_raise_to =
-            (to_call > 0 && other_live && raise_reopened && maximum_non_all_in >= minimum_raise)
-                .then_some(minimum_raise);
+        let min_raise_to = (self.current_wager > 0
+            && other_live
+            && raise_reopened
+            && maximum_non_all_in >= minimum_raise)
+            .then_some(minimum_raise);
 
         Some(MultiwayLegalActions {
             can_fold: to_call > 0,
@@ -664,6 +674,9 @@ impl MultiwayHand {
                 }
             }
             Action::Raise(_) => Err(ActionError::RaiseNotAllowed),
+            Action::AllIn(actual) if actual > self.current_wager && !legal.raise_reopened => {
+                Err(ActionError::RaiseNotReopened)
+            }
             Action::AllIn(actual) if actual == legal.all_in_to && actual > current => Ok(()),
             Action::AllIn(actual) => Err(ActionError::InvalidAllIn {
                 expected: legal.all_in_to,
@@ -1206,6 +1219,35 @@ mod tests {
             hand.validate_command(SeatCommand::new(seat(3), Action::Raise(22))),
             Err(CommandError::IllegalAction(ActionError::RaiseNotReopened))
         );
+        let before = format!("{hand:?}");
+        assert_eq!(
+            hand.apply_command(SeatCommand::new(seat(3), Action::AllIn(100))),
+            Err(CommandError::IllegalAction(ActionError::RaiseNotReopened))
+        );
+        assert_eq!(format!("{hand:?}"), before);
+    }
+
+    #[test]
+    fn big_blind_option_is_a_raise_with_a_full_blind_increment() {
+        let mut hand = table(3, &[200, 200, 200]);
+        apply(&mut hand, Action::Call(2));
+        apply(&mut hand, Action::Call(1));
+        let legal = hand.legal_actions_for(seat(2)).unwrap();
+        assert!(legal.can_check);
+        assert_eq!(legal.min_bet_to, None);
+        assert_eq!(legal.min_raise_to, Some(4));
+        let before = format!("{hand:?}");
+        assert!(hand
+            .apply_command(SeatCommand::new(seat(2), Action::Bet(2)))
+            .is_err());
+        assert!(hand
+            .apply_command(SeatCommand::new(seat(2), Action::Raise(3)))
+            .is_err());
+        assert_eq!(format!("{hand:?}"), before);
+        apply(&mut hand, Action::Raise(4));
+        assert_eq!(hand.current_wager, 4);
+        assert_eq!(hand.last_full_raise_size, 2);
+        assert_eq!(hand.to_act, Some(seat(0)));
     }
 
     #[test]

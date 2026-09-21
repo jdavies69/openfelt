@@ -459,7 +459,7 @@ fn action_is_legal(legal: &MultiwayLegalActions, action: Action) -> bool {
         Action::Raise(amount) => legal
             .min_raise_to
             .is_some_and(|minimum| amount >= minimum && amount < legal.all_in_to),
-        Action::AllIn(amount) => amount == legal.all_in_to,
+        Action::AllIn(amount) => amount == legal.all_in_to && legal.can_all_in(),
     }
 }
 
@@ -486,7 +486,11 @@ pub fn passive_action(legal: &MultiwayLegalActions) -> Action {
 }
 
 pub fn all_in_action(legal: &MultiwayLegalActions) -> Action {
-    Action::AllIn(legal.all_in_to)
+    if legal.can_all_in() {
+        Action::AllIn(legal.all_in_to)
+    } else {
+        passive_action(legal)
+    }
 }
 
 pub fn snapshot_identity(snapshot: &SnapshotEnvelope) -> (TableId, HandId) {

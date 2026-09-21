@@ -19,6 +19,7 @@ pub mod table_actor;
 pub mod table_actor_review;
 pub mod table_registry;
 pub mod tournament;
+pub mod trainer;
 pub mod training;
 pub mod ui;
 

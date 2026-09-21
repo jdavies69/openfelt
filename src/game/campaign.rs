@@ -306,7 +306,9 @@ fn choose_action(legal: &MultiwayLegalActions, rng: &mut StdRng) -> Action {
     if let Some(target) = legal.min_raise_to {
         actions.push(Action::Raise(target));
     }
-    actions.push(Action::AllIn(legal.all_in_to));
+    if legal.can_all_in() {
+        actions.push(Action::AllIn(legal.all_in_to));
+    }
     *actions
         .choose(rng)
         .expect("an acting seat always has at least one legal action")

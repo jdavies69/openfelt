@@ -48,3 +48,12 @@ __pycache__/
 *.key
 # Deliberately public artificial key required by TLS regression tests
 !/tests/fixtures/tls/server.key
+
+# OpenFelt private learning state, including explicitly chosen in-repo data folders
+/openfelt-data/
+/settings.json
+/progress.json
+**/decisions.jsonl
+**/cloud-feedback.jsonl
+**/cash-events.jsonl
+**/usage.jsonl
