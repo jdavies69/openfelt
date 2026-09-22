@@ -3,6 +3,8 @@ pub mod coaching;
 pub mod drills;
 pub mod evaluation;
 pub mod facts;
+#[cfg(target_os = "macos")]
+pub mod macos_credentials;
 pub mod policy;
 pub mod provider;
 pub mod replay;
@@ -10,6 +12,7 @@ pub mod replay_ui;
 pub mod storage;
 pub mod table_ui;
 pub mod tui;
+pub mod update;
 
 use crate::game::{
     actions::Action,

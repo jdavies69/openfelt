@@ -3,6 +3,7 @@ use super::{
     hero,
     provider::{self, CredentialTest, Pending, Provider, SystemKeyring, Usage},
     storage::{CoachingMode, Progress, Settings, Store},
+    update::{self, AvailableUpdate, UpdateDone, UpdateMessage},
     Session,
 };
 use crate::game::actions::Action;
@@ -38,6 +39,9 @@ struct SettingsEditor {
     confirm_test: bool,
     custom_model: bool,
     confirm_forget: bool,
+    update_note: String,
+    update_offer: Option<AvailableUpdate>,
+    confirm_install: bool,
 }
 impl SettingsEditor {
     fn switch_provider(&mut self, coaching: CoachingMode, source: String) {
@@ -81,6 +85,9 @@ struct Ui {
     saved_progress: Vec<u8>,
     settings: Option<SettingsEditor>,
     credential_test: Option<CredentialTest>,
+    update_task: Option<update::UpdateTask>,
+    practice_note: Option<String>,
+    restart_notice: Option<String>,
     first_run: bool,
 }
 pub fn run(
@@ -115,8 +122,12 @@ pub fn run(
         saved_progress: Vec::new(),
         settings: first_run.then(|| settings_editor(ui_settings_placeholder())),
         credential_test: None,
+        update_task: None,
+        practice_note: None,
+        restart_notice: None,
         first_run,
     };
+    ui.refresh_practice(&store);
     if let Some(editor) = &mut ui.settings {
         editor.draft = ui.session.settings.clone();
     }
@@ -135,6 +146,29 @@ pub fn run(
                 Err(e) => e,
             };
             redraw = true;
+        }
+        let update_messages = ui
+            .update_task
+            .as_ref()
+            .map(update::UpdateTask::drain)
+            .unwrap_or_default();
+        if !update_messages.is_empty() {
+            redraw = true;
+        }
+        let update_finished = update_messages
+            .iter()
+            .any(|message| matches!(message, UpdateMessage::Done(_)));
+        for message in update_messages {
+            match message {
+                UpdateMessage::Progress(text) => ui.status = text,
+                UpdateMessage::Done(result) => apply_update_result(&mut ui, result),
+            }
+        }
+        if update_finished {
+            ui.update_task = None;
+        }
+        if ui.restart_notice.is_some() {
+            break;
         }
         if let Some(result) = ui.pending.as_ref().and_then(Pending::poll) {
             redraw = true;
@@ -218,27 +252,13 @@ pub fn run(
             match key.code {
                 KeyCode::Esc => {
                     ui.credential_test = None;
+                    ui.update_task = None;
                     close = true;
                 }
                 KeyCode::Up => editor.field = editor.field.saturating_sub(1),
-                KeyCode::Down => editor.field = (editor.field + 1).min(7),
-                KeyCode::Char('v' | 'V') if editor.field == 2 => editor.reveal = !editor.reveal,
-                KeyCode::Char('x' | 'X') if editor.field == 2 => {
-                    if !editor.confirm_forget {
-                        editor.confirm_forget = true;
-                        ui.status = "Press X again to forget this provider's saved key".into();
-                    } else if let Some(kind) = selected_provider(editor.draft.coaching) {
-                        match provider::CredentialStore::delete(&SystemKeyring, kind) {
-                            Ok(()) => {
-                                editor.key.clear();
-                                ui.status = "Saved key forgotten; local coaching selected".into();
-                                editor.draft.coaching = CoachingMode::Local;
-                            }
-                            Err(e) => ui.status = e,
-                        }
-                        editor.confirm_forget = false;
-                    }
-                }
+                KeyCode::Down => editor.field = (editor.field + 1).min(8),
+                _ if editor.field == 2
+                    && apply_api_key_field(&mut editor, &mut ui.status, key, &SystemKeyring) => {}
                 KeyCode::Left | KeyCode::Right if editor.field == 0 => {
                     ui.credential_test = None;
                     let coaching = match editor.draft.coaching {
@@ -287,14 +307,6 @@ pub fn run(
                         editor.draft.cloud.model.push(c);
                     }
                 }
-                KeyCode::Backspace if editor.field == 2 => {
-                    editor.key.pop();
-                }
-                KeyCode::Char(c)
-                    if editor.field == 2 && !c.is_control() && editor.key.len() < 256 =>
-                {
-                    editor.key.push(c)
-                }
                 KeyCode::Left if editor.field == 3 => {
                     editor.draft.cloud.max_requests =
                         editor.draft.cloud.max_requests.saturating_sub(1).max(1)
@@ -328,15 +340,24 @@ pub fn run(
                         let result = selected_provider(editor.draft.coaching)
                             .ok_or_else(|| "Choose OpenAI or Anthropic".to_string())
                             .and_then(|kind| {
-                                let key = if editor.key.is_empty() {
-                                    provider::resolve_credential(kind, None, &SystemKeyring)?
-                                        .0
-                                        .ok_or_else(|| {
+                                let (key, source) = if editor.key.is_empty() {
+                                    let (key, source) =
+                                        provider::resolve_credential(kind, None, &SystemKeyring)?;
+                                    editor.source = format!("{source:?}");
+                                    (
+                                        key.ok_or_else(|| {
                                             "Enter or configure an API key".to_string()
-                                        })?
+                                        })?,
+                                        source,
+                                    )
                                 } else {
-                                    provider::Credential::new(editor.key.clone())?
+                                    editor.source = "Entered".into();
+                                    (
+                                        provider::Credential::new(editor.key.clone())?,
+                                        provider::CredentialSource::Cli,
+                                    )
                                 };
+                                let _ = source;
                                 provider::test_credential(
                                     kind,
                                     editor.draft.cloud.clone(),
@@ -347,7 +368,8 @@ pub fn run(
                         match result {
                             Ok(test) => {
                                 ui.credential_test = Some(test);
-                                ui.status = "Testing key…".into();
+                                ui.status =
+                                    format!("Testing {} key…", editor.source.to_ascii_lowercase());
                                 if let Err(e) = store.append("usage.jsonl", &ui.usage) {
                                     ui.status = e;
                                 }
@@ -355,6 +377,42 @@ pub fn run(
                             Err(e) => ui.status = e,
                         }
                         editor.confirm_test = false;
+                    }
+                }
+                KeyCode::Enter if editor.field == 8 => {
+                    if ui.update_task.is_some() {
+                        ui.status = "Update already in progress".into();
+                    } else if !updates_allowed(&ui) {
+                        ui.status =
+                            "Check and install updates between hands. Finish this hand first."
+                                .into();
+                    } else if let Some(offer) = editor.update_offer.clone() {
+                        if !editor.confirm_install {
+                            editor.confirm_install = true;
+                            ui.status = format!(
+                                "Enter again to install {} and quit. Esc cancels. No keys or hand history are sent.",
+                                offer.version
+                            );
+                        } else {
+                            match update::start_install(&offer) {
+                                Ok(task) => {
+                                    ui.update_task = Some(task);
+                                    editor.confirm_install = false;
+                                    ui.status =
+                                        "Downloading update… Esc cancels before replacement."
+                                            .into();
+                                }
+                                Err(e) => ui.status = e,
+                            }
+                        }
+                    } else {
+                        match update::start_check() {
+                            Ok(task) => {
+                                ui.update_task = Some(task);
+                                ui.status = "Checking GitHub releases…".into();
+                            }
+                            Err(e) => ui.status = e,
+                        }
                     }
                 }
                 KeyCode::Enter if editor.field == 7 => {
@@ -369,8 +427,8 @@ pub fn run(
                                 kind,
                                 credential,
                             )
-                            .map_err(|_| {
-                                "Settings saved, but the API key could not be saved".into()
+                            .map_err(|e| {
+                                format!("Settings saved, but the API key could not be saved: {e}")
                             });
                         }
                         store.save("settings.json", &editor.draft)
@@ -384,11 +442,24 @@ pub fn run(
                                     CoachingMode::Openai | CoachingMode::Anthropic
                                 );
                                 ui.first_run = false;
-                                ui.status = "Setup saved; local table is ready".into();
+                                ui.status = if editor.key.is_empty() {
+                                    "Setup saved; local table is ready".into()
+                                } else {
+                                    format!(
+                                        "Setup saved with API key. {}",
+                                        provider::credential_storage_hint()
+                                    )
+                                };
                             } else {
                                 ui.session.settings = editor.draft.clone();
-                                ui.status =
-                                    "Settings saved; table changes apply next session".into();
+                                ui.status = if editor.key.is_empty() {
+                                    "Settings saved; table changes apply next session".into()
+                                } else {
+                                    format!(
+                                        "Settings and API key saved. {}",
+                                        provider::credential_storage_hint()
+                                    )
+                                };
                             }
                             close = true;
                         }
@@ -407,7 +478,10 @@ pub fn run(
         }
         if let Some(mut replay) = ui.replay.take() {
             match replay.key(key.code, &store) {
-                Ok(true) => ui.status = "Returned to table".into(),
+                Ok(true) => {
+                    ui.refresh_practice(&store);
+                    ui.status = "Returned to table".into();
+                }
                 Ok(false) => ui.replay = Some(replay),
                 Err(e) => {
                     ui.status = e;
@@ -637,6 +711,7 @@ pub fn run(
                 Ok(d) => {
                     let f = local_feedback(d);
                     ui.progress.decisions += 1;
+                    ui.progress.note_review(&f.concept, &f.assessment);
                     *ui.progress.concepts.entry(f.concept.clone()).or_default() += 1;
                     if let Err(e) = store.decision(d, &f) {
                         ui.status = e;
@@ -644,6 +719,7 @@ pub fn run(
                         ui.status =
                             "Decision accepted · hand paused · Enter continues · ? details".into();
                     }
+                    ui.refresh_practice(&store);
                     ui.feedback = Some(f);
                     if ui.cloud_enabled {
                         ui.request(&store);
@@ -654,7 +730,16 @@ pub fn run(
         }
     }
     ui.pending = None;
+    ui.update_task = None;
     ui.save_progress(&store);
+    let restart = ui.restart_notice.clone();
+    drop(terminal);
+    drop(_guard);
+    if let Some(version) = restart {
+        println!(
+            "OpenFelt {version} is installed. Open a new terminal and run `openfelt --version`."
+        );
+    }
     Ok(())
 }
 
@@ -740,6 +825,74 @@ impl Ui {
             self.replay_saved += 1;
         }
     }
+    fn refresh_practice(&mut self, store: &Store) {
+        let bookmarks = super::replay::Archive::load(&store.root)
+            .map(|archive| archive.bookmarked_concepts())
+            .unwrap_or_default();
+        self.practice_note = super::drills::recommendation_with(&self.progress, &bookmarks);
+    }
+}
+fn updates_allowed(ui: &Ui) -> bool {
+    ui.first_run || ui.session.finished()
+}
+fn apply_update_result(ui: &mut Ui, result: Result<UpdateDone, String>) {
+    match result {
+        Ok(UpdateDone::Checked(update::CheckResult::UpToDate { version })) => {
+            ui.status = format!("OpenFelt {version} is up to date.");
+            if let Some(editor) = &mut ui.settings {
+                editor.update_note = format!("installed {version} · up to date");
+                editor.update_offer = None;
+                editor.confirm_install = false;
+            }
+        }
+        Ok(UpdateDone::Checked(update::CheckResult::NoRelease)) => {
+            ui.status = "No stable OpenFelt release is published yet.".into();
+            if let Some(editor) = &mut ui.settings {
+                editor.update_note = format!(
+                    "installed {} · no stable release",
+                    update::current_version()
+                );
+                editor.update_offer = None;
+                editor.confirm_install = false;
+            }
+        }
+        Ok(UpdateDone::Checked(update::CheckResult::Available(offer))) => {
+            let origin = update::current_origin();
+            if !origin.allows_replacement() {
+                ui.status = origin.guidance().into();
+                if let Some(editor) = &mut ui.settings {
+                    editor.update_note = "use the installer’s upgrade command".into();
+                    editor.update_offer = None;
+                    editor.confirm_install = false;
+                }
+            } else if !updates_allowed(ui) {
+                ui.status = format!(
+                    "Update {} is ready. Install it between hands.",
+                    offer.version
+                );
+                if let Some(editor) = &mut ui.settings {
+                    editor.update_note = format!("install {} between hands", offer.version);
+                    editor.update_offer = Some(offer);
+                    editor.confirm_install = false;
+                }
+            } else {
+                ui.status = format!(
+                    "Update {} available. Notes: {}. Enter installs and quits.",
+                    offer.version, offer.notes_url
+                );
+                if let Some(editor) = &mut ui.settings {
+                    editor.update_note = format!("install {} · Enter confirms", offer.version);
+                    editor.update_offer = Some(offer);
+                    editor.confirm_install = false;
+                }
+            }
+        }
+        Ok(UpdateDone::Installed(version)) => {
+            ui.status = format!("OpenFelt {version} installed. Open a new terminal to run it.");
+            ui.restart_notice = Some(version);
+        }
+        Err(error) => ui.status = error,
+    }
 }
 fn replay_available(ui: &Ui) -> bool {
     ui.session.finished() && ui.session.coaching.is_none() && matches!(ui.input, Input::Play)
@@ -764,7 +917,24 @@ fn settings_editor(draft: Settings) -> SettingsEditor {
         confirm_test: false,
         custom_model: false,
         confirm_forget: false,
+        update_note: format!("installed {} · Enter checks", update::current_version()),
+        update_offer: None,
+        confirm_install: false,
     }
+}
+
+fn refresh_credential_source_label(editor: &mut SettingsEditor) {
+    if !editor.key.is_empty() {
+        editor.source = "Entered".into();
+        return;
+    }
+    editor.source = selected_provider(editor.draft.coaching)
+        .and_then(|kind| {
+            provider::resolve_credential(kind, None, &SystemKeyring)
+                .ok()
+                .map(|(_, source)| format!("{source:?}"))
+        })
+        .unwrap_or_else(|| "local".into());
 }
 fn selected_provider(mode: CoachingMode) -> Option<Provider> {
     match mode {
@@ -772,6 +942,68 @@ fn selected_provider(mode: CoachingMode) -> Option<Provider> {
         CoachingMode::Anthropic => Some(Provider::Anthropic),
         _ => None,
     }
+}
+
+/// API-key field input. Plain characters (including `x`/`v`) always insert into the
+/// draft secret. Reveal / Forget use Ctrl so they cannot collide with paste.
+/// Returns true when the event was handled for this field.
+fn apply_api_key_field(
+    editor: &mut SettingsEditor,
+    status: &mut String,
+    key: event::KeyEvent,
+    store: &dyn provider::CredentialStore,
+) -> bool {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let handled = match key.code {
+        KeyCode::Backspace if !control => {
+            editor.key.pop();
+            editor.confirm_forget = false;
+            true
+        }
+        KeyCode::Char('v' | 'V') if control => {
+            editor.reveal = !editor.reveal;
+            editor.confirm_forget = false;
+            true
+        }
+        KeyCode::Char('x' | 'X') if control => {
+            if !editor.confirm_forget {
+                editor.confirm_forget = true;
+                *status = "Press Ctrl-X again to forget this provider's saved key".into();
+            } else if let Some(kind) = selected_provider(editor.draft.coaching) {
+                match store.delete(kind) {
+                    Ok(()) => {
+                        editor.key.clear();
+                        *status = format!(
+                            "Saved key forgotten; local coaching selected. {}",
+                            provider::credential_storage_hint()
+                        );
+                        editor.draft.coaching = CoachingMode::Local;
+                    }
+                    Err(e) => *status = e,
+                }
+                editor.confirm_forget = false;
+            } else {
+                editor.confirm_forget = false;
+                *status = "Choose OpenAI or Anthropic before forgetting a key".into();
+            }
+            true
+        }
+        KeyCode::Char(c)
+            if !control
+                && !key.modifiers.contains(KeyModifiers::ALT)
+                && !c.is_control()
+                && editor.key.len() < 256 =>
+        {
+            editor.key.push(c);
+            editor.confirm_forget = false;
+            true
+        }
+        _ => false,
+    };
+    if handled {
+        refresh_credential_source_label(editor);
+    }
+    handled
 }
 fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
     if let Some(replay) = &ui.replay {
@@ -803,7 +1035,7 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
                     &editor.draft.cloud.model
                 }
             ),
-            format!("API key        {key}   [V reveal · X forget]"),
+            format!("API key        {key}   [Ctrl-V reveal · Ctrl-X forget]"),
             format!(
                 "Session limit  {} requests",
                 editor.draft.cloud.max_requests
@@ -819,6 +1051,15 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
                 "Test key       explicit one-request check".into()
             },
             "Save and return".into(),
+            format!(
+                "Updates        {}{}",
+                editor.update_note,
+                if editor.confirm_install {
+                    " · CONFIRM install"
+                } else {
+                    ""
+                }
+            ),
             format!(
                 "Cloud limits   {} output tokens · budget {} · pricing {}",
                 editor.draft.cloud.max_output_tokens,
@@ -851,7 +1092,7 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
             x: area.x + 4,
             y: area.y + 3,
             width: area.width.saturating_sub(8),
-            height: 16.min(area.height.saturating_sub(6)),
+            height: 18.min(area.height.saturating_sub(4)),
         };
         frame.render_widget(ratatui::widgets::Clear, panel);
         frame.render_widget(
@@ -872,7 +1113,7 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
         let kind = selected_provider(ui.session.settings.coaching).expect("cloud consent provider");
         (" ENABLE OPTIONAL CLOUD COACHING ",format!("Destination: {}\nModel: {} · credential: {} or OS keychain\nOnly your pre-decision cards, public table/action data and teaching facts leave this device.\nProvider charges and data terms apply. Limit: {} requests / session.\nEnter enables paid coaching this session. Esc or L plays with local teaching.\nNo request is made until you accept a poker decision.",kind.endpoint(),ui.session.settings.cloud.model,kind.environment(),ui.session.settings.cloud.max_requests))
     } else if ui.help {
-        (" HOW TO PLAY ","F folds · C checks or calls · R opens bet/raise TO entry in chips.\nEnter submits an amount; arrows adjust by one chip. A asks for all-in confirmation.\nAfter every accepted decision the table pauses: Enter continues, ? expands teaching.\nBetween hands: V browses saved hands; B tops up/rebuys; W withdraws; Enter deals.\nIn replay: arrows browse; B bookmarks; O shows outcome; Esc returns.\nRun openfelt --drill <topic> for a short offline practice set.\nBots use reviewed heuristic ranges, style, and difficulty—not solver strategies.\nSettings and private learning history live in your local OpenFelt data folder.\nQ quits at any time. No timer acts for you.".into())
+        (" HOW TO PLAY ","F folds · C checks or calls · R opens bet/raise TO entry in chips.\nEnter submits an amount; arrows adjust by one chip. A asks for all-in confirmation.\nAfter every accepted decision the table pauses: Enter continues, ? expands teaching.\nBetween hands: V browses saved hands; B tops up/rebuys; W withdraws; Enter deals.\nIn replay: arrows browse; B bookmarks; O shows outcome; Esc returns.\nRun openfelt --drill <topic> for a short offline practice set.\nS opens settings. Between hands, Updates can check for a release; it never installs by itself.\nBots use reviewed heuristic ranges, style, and difficulty—not solver strategies.\nSettings and private learning history live in your local OpenFelt data folder.\nQ quits at any time. No timer acts for you.".into())
     } else if matches!(ui.input, Input::AllIn) {
         (
             " CONFIRM ALL-IN ",
@@ -938,7 +1179,12 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
             ),
         )
     } else if ui.session.finished() {
-        (" HAND COMPLETE ",format!("Session profit: {:+} chips (excludes top-ups and withdrawals).\nLifetime: {} completed hands · {} decisions reviewed.\nEnter next hand · B top up/rebuy to 100BB · W withdraw chips\nBot busts rebuy automatically and are recorded as external chip additions.",ui.session.session_profit,ui.progress.hands,ui.progress.decisions))
+        let practice = ui
+            .practice_note
+            .as_ref()
+            .map(|note| format!("\n{note}"))
+            .unwrap_or_default();
+        (" HAND COMPLETE ",format!("Session profit: {:+} chips (excludes top-ups and withdrawals).\nProgress: {} completed hands · {} decisions reviewed.\nEnter next hand · B top up/rebuy to 100BB · W withdraw chips\nBot busts rebuy automatically and are recorded as external chip additions.{practice}",ui.session.session_profit,ui.progress.hands,ui.progress.decisions))
     } else if p.to_act == Some(hero()) {
         (
             " YOUR NEXT DECISION ",
@@ -1121,6 +1367,9 @@ mod tests {
             saved_progress: vec![],
             settings: None,
             credential_test: None,
+            update_task: None,
+            practice_note: None,
+            restart_notice: None,
             first_run: false,
         }
     }
@@ -1162,6 +1411,9 @@ mod tests {
             confirm_test: false,
             custom_model: false,
             confirm_forget: false,
+            update_note: format!("installed {} · Enter checks", update::current_version()),
+            update_offer: None,
+            confirm_install: false,
         });
         let screen = rendered(&ui, 100, 36);
         assert!(screen.contains("SETTINGS"));
@@ -1169,6 +1421,72 @@ mod tests {
         assert!(!screen.contains("sk-secretabcd"));
         assert!(screen.contains("explicit one-request check"));
         assert!(screen.contains("credential source: Keyring"));
+        assert!(screen.contains("Ctrl-V reveal"));
+        assert!(screen.contains("Ctrl-X forget"));
+        assert!(screen.contains("Updates"));
+        assert!(screen.contains(update::current_version()));
+    }
+    #[test]
+    fn api_key_paste_keeps_x_and_provider() {
+        struct FakeStore;
+        impl provider::CredentialStore for FakeStore {
+            fn get(&self, _: Provider) -> Result<Option<provider::Credential>, String> {
+                Ok(None)
+            }
+            fn set(&self, _: Provider, _: provider::Credential) -> Result<(), String> {
+                Ok(())
+            }
+            fn delete(&self, _: Provider) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let mut editor = SettingsEditor {
+            draft: Settings {
+                coaching: CoachingMode::Openai,
+                ..Default::default()
+            },
+            field: 2,
+            key: String::new(),
+            reveal: false,
+            source: "Missing".into(),
+            confirm_test: false,
+            custom_model: false,
+            confirm_forget: false,
+            update_note: "installed".into(),
+            update_offer: None,
+            confirm_install: false,
+        };
+        let mut status = String::new();
+        let store = FakeStore;
+        // Mimic a paste that includes lowercase and uppercase x (and v), which used
+        // to arm Forget / toggle Reveal instead of inserting.
+        let pasted = "sk-proj-abcxXvwzgA";
+        for ch in pasted.chars() {
+            assert!(apply_api_key_field(
+                &mut editor,
+                &mut status,
+                event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &store,
+            ));
+        }
+        assert_eq!(editor.key, pasted);
+        assert_eq!(editor.draft.coaching, CoachingMode::Openai);
+        assert!(!editor.confirm_forget);
+        assert!(!editor.reveal);
+        assert!(status.is_empty());
+
+        // Ctrl-X arms forget without inserting; provider stays until confirmed.
+        assert!(apply_api_key_field(
+            &mut editor,
+            &mut status,
+            event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            &store,
+        ));
+        assert_eq!(editor.key, pasted);
+        assert!(editor.confirm_forget);
+        assert!(status.contains("Ctrl-X"));
+        assert_eq!(editor.draft.coaching, CoachingMode::Openai);
     }
     #[test]
     fn provider_switch_discards_uncommitted_secret_and_confirmations() {
@@ -1184,6 +1502,9 @@ mod tests {
             confirm_test: true,
             custom_model: true,
             confirm_forget: true,
+            update_note: "installed".into(),
+            update_offer: None,
+            confirm_install: false,
         };
         editor.switch_provider(CoachingMode::Anthropic, "Missing".into());
         assert!(editor.key.is_empty());

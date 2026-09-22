@@ -73,6 +73,20 @@ pub struct Progress {
     pub concepts: BTreeMap<String, u64>,
     /// Drill outcomes are distinct from passive concept exposure during hands.
     pub drills: BTreeMap<String, DrillProgress>,
+    /// Local heuristic assessments. Exposure alone is not treated as a weakness.
+    pub review_patterns: BTreeMap<String, ReviewPattern>,
+}
+impl Progress {
+    pub fn note_review(&mut self, concept: &str, assessment: &str) {
+        if concept.is_empty() {
+            return;
+        }
+        let entry = self.review_patterns.entry(concept.to_string()).or_default();
+        entry.seen += 1;
+        if assessment == "reconsider" {
+            entry.reconsider += 1;
+        }
+    }
 }
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -80,6 +94,12 @@ pub struct DrillProgress {
     pub attempts: u64,
     pub correct: u64,
     pub completed_sets: u64,
+}
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReviewPattern {
+    pub seen: u64,
+    pub reconsider: u64,
 }
 pub struct Store {
     pub root: PathBuf,

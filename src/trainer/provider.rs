@@ -126,7 +126,14 @@ impl Credential {
         Self::new(key)
     }
     pub fn new(key: String) -> Result<Self, String> {
-        if key.trim().is_empty() || key.contains(['\r', '\n']) {
+        // Trim paste whitespace / BOM; reject embedded newlines. Do not log the value.
+        let key = key
+            .trim()
+            .trim_start_matches('\u{feff}')
+            .chars()
+            .filter(|c| !matches!(c, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}'))
+            .collect::<String>();
+        if key.is_empty() || key.contains(['\r', '\n']) {
             return Err("Invalid credential".into());
         }
         Ok(Self(key))
@@ -141,6 +148,7 @@ pub trait CredentialStore {
 
 pub struct SystemKeyring;
 impl SystemKeyring {
+    #[cfg(not(target_os = "macos"))]
     fn entry(provider: Provider) -> Result<keyring::Entry, String> {
         keyring::Entry::new(KEYRING_SERVICE, provider.account())
             .map_err(|_| "Cannot access the operating-system credential store".into())
@@ -148,22 +156,63 @@ impl SystemKeyring {
 }
 impl CredentialStore for SystemKeyring {
     fn get(&self, provider: Provider) -> Result<Option<Credential>, String> {
-        match Self::entry(provider)?.get_password() {
-            Ok(value) => Credential::new(value).map(Some),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(_) => Err("Cannot read the saved coaching credential".into()),
+        #[cfg(target_os = "macos")]
+        {
+            super::macos_credentials::get(provider)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            match Self::entry(provider)?.get_password() {
+                Ok(value) => Credential::new(value).map(Some),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(_) => Err("Cannot read the saved coaching credential".into()),
+            }
         }
     }
     fn set(&self, provider: Provider, credential: Credential) -> Result<(), String> {
-        Self::entry(provider)?
-            .set_password(&credential.0)
-            .map_err(|_| "Cannot save the coaching credential".into())
+        #[cfg(target_os = "macos")]
+        {
+            super::macos_credentials::set(provider, &credential.0)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self::entry(provider)?
+                .set_password(&credential.0)
+                .map_err(|_| "Cannot save the coaching credential".into())
+        }
     }
     fn delete(&self, provider: Provider) -> Result<(), String> {
-        match Self::entry(provider)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(_) => Err("Cannot forget the coaching credential".into()),
+        #[cfg(target_os = "macos")]
+        {
+            super::macos_credentials::delete(provider)
         }
+        #[cfg(not(target_os = "macos"))]
+        {
+            match Self::entry(provider)?.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(_) => Err("Cannot forget the coaching credential".into()),
+            }
+        }
+    }
+}
+
+/// Short platform note for Settings / docs. Never mentions secret material.
+pub fn credential_storage_hint() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        super::macos_credentials::storage_hint()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "Saved in Windows Credential Manager under the OpenFelt coaching service."
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "Saved in the desktop Secret Service / keyring under the OpenFelt coaching service."
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        "Saved in the operating-system credential store when available."
     }
 }
 
@@ -209,6 +258,76 @@ pub fn mask_credential(value: &str, reveal: bool) -> String {
         .map(|(prefix, _)| format!("{prefix}-"))
         .unwrap_or_default();
     format!("{prefix}••••••••{suffix}")
+}
+
+/// Reject secrets that cannot be a provider API key before a billable request.
+/// Returns a short status string; never echoes the secret.
+pub fn credential_shape_error(provider: Provider, secret: &str) -> Option<&'static str> {
+    match provider {
+        Provider::Openai => {
+            if !secret.starts_with("sk-") {
+                Some("Saved secret does not look like an OpenAI API key (expected sk-…)")
+            } else if secret.len() < 20 {
+                Some("Saved secret is too short to be an OpenAI API key")
+            } else {
+                None
+            }
+        }
+        Provider::Anthropic => {
+            if !(secret.starts_with("sk-ant-") || secret.starts_with("sk-")) {
+                Some("Saved secret does not look like an Anthropic API key")
+            } else if secret.len() < 20 {
+                Some("Saved secret is too short to be an Anthropic API key")
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Map provider HTTP failures to short, secret-free status text.
+/// Only 401/403 are labeled authentication; 400/404/etc. stay as provider error.
+pub fn classify_provider_http_status(status: u16, prefix: &str) -> String {
+    match status {
+        401 | 403 => format!("{prefix}: authentication rejected (HTTP {status})"),
+        429 => format!("{prefix}: rate limit or credit exhausted (HTTP {status})"),
+        300..=399 => format!("{prefix}: redirects are not allowed (HTTP {status})"),
+        other => format!("{prefix}: provider error (HTTP {other})"),
+    }
+}
+
+/// Append a safe `error.code` / `error.type` from a provider JSON body when present.
+pub fn classify_provider_http_failure(status: u16, body: &[u8], prefix: &str) -> String {
+    let mut message = classify_provider_http_status(status, prefix);
+    if let Some(code) = safe_provider_error_code(body) {
+        message.push_str(" [");
+        message.push_str(&code);
+        message.push(']');
+    }
+    message
+}
+
+fn safe_provider_error_code(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let code = value
+        .pointer("/error/code")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            value
+                .pointer("/error/type")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })?;
+    if code.len() <= 64
+        && code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        Some(code.to_string())
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -285,6 +404,9 @@ pub fn test_credential(
     if settings.model.is_empty() {
         return Err("Choose a model before testing the key".into());
     }
+    if let Some(issue) = credential_shape_error(provider, &key.0) {
+        return Err(issue.into());
+    }
     let body = match provider {
         Provider::Openai => {
             json!({"model":settings.model,"store":false,"max_output_tokens":16,"input":"Reply with OK."})
@@ -311,11 +433,13 @@ pub fn test_credential(
                         Provider::Anthropic => request.header("x-api-key", &key.0).header("anthropic-version", "2023-06-01"),
                     };
                     let response = request.send().await.map_err(|_| "Key test failed: connection failed or timed out")?;
-                    if response.status().is_success() { Ok(()) } else { Err(match response.status().as_u16() {
-                        401 | 403 => "Key test failed: authentication rejected",
-                        429 => "Key test failed: rate limit or credit exhausted",
-                        _ => "Key test failed: provider error",
-                    }.into()) }
+                    let status = response.status().as_u16();
+                    if response.status().is_success() {
+                        Ok(())
+                    } else {
+                        let bytes = response.bytes().await.unwrap_or_default();
+                        Err(classify_provider_http_failure(status, &bytes, "Key test failed"))
+                    }
                 } => result,
             }}),
             Err(_) => Err("Cannot start key test".into()),
@@ -354,6 +478,9 @@ pub fn start(
     settings.validate()?;
     if settings.model.is_empty() {
         return Err("Choose a model before enabling cloud coaching".into());
+    }
+    if let Some(issue) = credential_shape_error(provider, &key.0) {
+        return Err(issue.into());
     }
     let body = request_body_for(provider, &d, &settings);
     let bytes = serde_json::to_vec(&body).map_err(|_| "Cannot encode coaching request")?;
@@ -427,13 +554,12 @@ async fn send_request(
         .map_err(|_| "Coaching unavailable: connection failed or timed out")?;
     let status = response.status();
     if !status.is_success() {
-        return Err(match status.as_u16() {
-            401 | 403 => "Coaching unavailable: authentication rejected",
-            429 => "Coaching unavailable: rate limit or credit exhausted",
-            300..=399 => "Coaching unavailable: redirects are not allowed",
-            _ => "Coaching unavailable: provider error",
-        }
-        .into());
+        let bytes = response.bytes().await.unwrap_or_default();
+        return Err(classify_provider_http_failure(
+            status.as_u16(),
+            &bytes,
+            "Coaching unavailable",
+        ));
     }
     let mut response = response;
     let mut bytes = Vec::new();
@@ -598,10 +724,45 @@ mod tests {
     fn credential_mask_models_and_store_contract() {
         assert_eq!(mask_credential("sk-exampleabcd", false), "sk-••••••••abcd");
         assert_eq!(mask_credential("sk-exampleabcd", true), "sk-exampleabcd");
+        assert_eq!(
+            Credential::new("  sk-trimmed-key  ".into()).unwrap().0,
+            "sk-trimmed-key"
+        );
+        assert_eq!(
+            Credential::new("\nsk-edge-trim\n".into()).unwrap().0,
+            "sk-edge-trim"
+        );
+        assert!(Credential::new("sk-bad\nmiddle".into()).is_err());
         assert!(Provider::Openai.models().contains(&"gpt-5"));
+        let auth = classify_provider_http_status(401, "Coaching unavailable");
+        assert!(auth.contains("authentication rejected"));
+        assert!(auth.contains("HTTP 401"));
+        let with_code = classify_provider_http_failure(
+            401,
+            br#"{"error":{"message":"bad","type":"invalid_request_error","code":"invalid_api_key"}}"#,
+            "Key test failed",
+        );
+        assert!(with_code.contains("invalid_api_key"));
+        assert!(!with_code.contains("sk-"));
+        let bad_model = classify_provider_http_status(400, "Coaching unavailable");
+        assert!(bad_model.contains("provider error"));
+        assert!(!bad_model.contains("authentication"));
+        let missing = classify_provider_http_status(404, "Coaching unavailable");
+        assert!(missing.contains("provider error"));
+        assert!(!missing.contains("authentication"));
+        assert!(credential_shape_error(Provider::Openai, "not-a-key").is_some());
+        assert!(credential_shape_error(Provider::Openai, "sk-short").is_some());
+        assert!(
+            credential_shape_error(Provider::Openai, &format!("sk-{}", "a".repeat(40))).is_none()
+        );
+        assert!(
+            credential_shape_error(Provider::Anthropic, "sk-ant-abcdefghijklmnopqrstuvwxyz")
+                .is_none()
+        );
         assert!(Provider::Anthropic
             .models()
             .contains(&"claude-haiku-4-5-20251001"));
+        assert!(!credential_storage_hint().is_empty());
         let store = MemoryStore::default();
         store
             .set(
@@ -613,8 +774,19 @@ mod tests {
             resolve_credential(Provider::Openai, Some("cli-secret".into()), &store).unwrap();
         assert_eq!(source, CredentialSource::Cli);
         assert_eq!(value.unwrap().0, "cli-secret");
+        assert_eq!(
+            store.get(Provider::Openai).unwrap().unwrap().0,
+            "stored-secret"
+        );
         store.delete(Provider::Openai).unwrap();
         assert!(store.get(Provider::Openai).unwrap().is_none());
+        // Missing path: only assert when the provider env var is unset so
+        // precedence stays env → store → none without mutating the process env.
+        if std::env::var_os(Provider::Openai.environment()).is_none() {
+            let (missing, source) = resolve_credential(Provider::Openai, None, &store).unwrap();
+            assert!(missing.is_none());
+            assert_eq!(source, CredentialSource::Missing);
+        }
     }
     #[test]
     fn anthropic_body_and_response_keep_the_same_feedback_boundary() {

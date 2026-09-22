@@ -358,6 +358,12 @@ fn style_and_difficulty_have_seeded_observable_behavior() {
         }
     }
     assert!(beginner_continues > 0); // fixed seeds exercise the documented extra inconsistency
+    assert!(policy::behavior_limitations()
+        .iter()
+        .any(|note| note.contains("not been calibrated")));
+    assert!(policy::behavior_limitations()
+        .iter()
+        .any(|note| note.contains("measured skill rating")));
 }
 #[test]
 fn stored_settings_and_progress_roundtrip_without_secret_fields() {
