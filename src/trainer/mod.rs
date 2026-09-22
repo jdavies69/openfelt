@@ -10,6 +10,7 @@ pub mod provider;
 pub mod replay;
 pub mod replay_ui;
 pub mod storage;
+pub mod table_ui;
 pub mod tui;
 pub mod update;
 
@@ -108,6 +109,27 @@ impl Session {
             )
             .expect("hero occupies table")
         })
+    }
+
+    /// Public, player-facing action copy for the table rail. The renderer gets
+    /// descriptions only; it never receives an authoritative deck or hidden
+    /// opponent cards.
+    pub fn recent_actions(&self) -> Vec<String> {
+        self.hand
+            .action_history
+            .iter()
+            .rev()
+            .take(8)
+            .rev()
+            .map(|record| {
+                let actor = if record.seat == hero() {
+                    "you".to_string()
+                } else {
+                    format!("bot {}", record.seat.as_u8())
+                };
+                format!("{actor} {}", record.action.description())
+            })
+            .collect()
     }
     pub fn observation(&self, actor: SeatId) -> Result<Observation, String> {
         let projection = project_hand(

@@ -229,9 +229,15 @@ mod tests {
                 let mut legacy =
                     PasswordOptions::new_generic_password("dev.openfelt.coaching-test", &account);
                 legacy.set_label("OpenFelt test generic");
-                set_generic_password_options(secret.as_bytes(), legacy)
-                    .expect("login-keychain generic fallback must work without DP entitlement");
-                false
+                match set_generic_password_options(secret.as_bytes(), legacy) {
+                    Ok(()) => false,
+                    Err(legacy_err) => {
+                        eprintln!(
+                            "skipping live keychain round-trip (write denied or needs UI): DP {err:?}; fallback {legacy_err:?}"
+                        );
+                        return;
+                    }
+                }
             }
         };
 

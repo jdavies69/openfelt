@@ -89,8 +89,9 @@ with tempfile.TemporaryDirectory(prefix="openfelt-pty-") as root:
     print("PASS: upper/lower F C R A, one accepted decision, coaching pause, details, quit")
 
     g = Game(Path(root) / "invalid")
-    g.send("r3\r")
+    g.send("r")
     assert not g.decisions()
+    g.send("\x1b")
     g.send("a")
     assert not g.decisions()
     g.send("\x1b")

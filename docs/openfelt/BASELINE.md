@@ -34,6 +34,6 @@ Source minimums: shell home 40×20; other shell routes 80×24. The nine-seat tab
 - `src/game/multiway.rs`: two-to-nine-seat authoritative engine, configurable blinds, legal actions, separate side pots and unmatched returns.
 - `src/training/observation.rs`: own-player observation checks acting seat and history revision; amount_to_call is uncapped, and pot odds use the entire pot. Do not use that ratio as general short-stack or side-pot coaching truth.
 - `src/ui/input.rs` and newer shell: reusable action concepts, but the old controller accepts the heads-up state and is not a multiway trainer.
-- `.github/workflows/ci.yml`: four platform matrix declared; only local macOS results above are claimed here. Release workflow is tag driven (also plans on PR); publish-crates is callable and expects a registry secret. No release tag or registry publishing was performed.
+- Historical baseline: `.github/workflows/ci.yml` then declared a four-platform matrix including Intel macOS; only the local macOS results above were claimed. Intel macOS has since been deprecated. The current supported matrix is Linux x86_64, Windows x86_64, and macOS Apple Silicon. Release workflow is tag driven (also plans on PR); publish-crates is callable and expects a registry secret. No release tag or registry publishing was performed.
 
 This is a focused integration audit, not a complete security or poker-strategy certification. Three ignored upstream tests remain ignored.

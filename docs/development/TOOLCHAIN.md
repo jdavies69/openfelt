@@ -1,14 +1,15 @@
 # Development toolchain
 
 Use current stable Rust, including rustfmt and Clippy, with the committed
-Cargo.lock. The Quality workflow runs on Linux, Windows, Apple Silicon macOS and
-Intel macOS. Install Rust using https://rust-lang.org/tools/install/.
+Cargo.lock. The Quality workflow runs on Linux x86_64, Windows x86_64, and Apple
+Silicon macOS. Intel macOS is deprecated and is not a supported CI or release
+target. Install Rust using https://rust-lang.org/tools/install/.
 
 ## Platform prerequisites
 
 - macOS: Apple's Command Line Tools provide the C compiler/linker needed by native
   dependencies. Run `xcode-select --install` if they are not already installed.
-  Rustup chooses the native Apple Silicon or Intel toolchain.
+  Releases and CI target Apple Silicon (`aarch64-apple-darwin`).
 - Windows: the normal MSVC toolchain needs the Visual Studio C++ Build Tools and
   Windows SDK. The development workstation also validated the GNU toolchain.
 - Linux: install your distribution's C compiler/linker toolchain. The dedicated

@@ -25,8 +25,10 @@ Linux 319 / 0 / 3. Strict Clippy and optimized builds passed.
 The owner authorized a fork PR following the [tracking audit](../development/PR_TRACKING_AUDIT.md).
 The [explicit file list](../development/PR_FILE_LIST.txt) excludes private/generated
 state and historical research/design archives. An isolated source-only snapshot
-passed all 321 Windows tests. Portable onboarding and a four-platform Quality
-matrix are included; PR CI results will establish the native Mac build status.
+passed all 321 Windows tests. Portable onboarding and a historical four-platform
+Quality matrix were included. Intel macOS is now deprecated; current CI supports
+Linux x86_64, Windows x86_64, and macOS Apple Silicon. PR CI results establish the
+supported native Mac build status.
 A real Mac terminal session and Ash's network route still need validation.
 
 Historical sprint reviews and screenshots are retained locally rather than

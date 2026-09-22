@@ -14,9 +14,8 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Layout},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
+    style::{Color, Style},
+    text::Line,
     widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
@@ -27,7 +26,7 @@ use std::{
 
 enum Input {
     Play,
-    Raise(String),
+    Raise { amount: String, typing: bool },
     AllIn,
     Withdraw(String),
 }
@@ -71,6 +70,7 @@ struct Ui {
     pending: Option<Pending>,
     status: String,
     deep: bool,
+    deep_scroll: u16,
     help: bool,
     consent: bool,
     cloud_enabled: bool,
@@ -107,6 +107,7 @@ pub fn run(
         pending: None,
         status: "F fold · C check/call · R raise · A all-in · ? help".into(),
         deep: false,
+        deep_scroll: 0,
         help: false,
         consent,
         cloud_enabled: false,
@@ -519,6 +520,7 @@ pub fn run(
         if code == KeyCode::Char('?') {
             if ui.session.coaching.is_some() {
                 ui.deep = !ui.deep;
+                ui.deep_scroll = 0;
             } else {
                 ui.help = !ui.help;
             }
@@ -531,13 +533,21 @@ pub fn run(
             continue;
         }
         if ui.session.coaching.is_some() {
+            if ui.deep && scroll_deep(&mut ui.deep_scroll, code) {
+                continue;
+            }
             match code {
+                KeyCode::Esc if ui.deep => {
+                    ui.deep = false;
+                    ui.deep_scroll = 0;
+                }
                 KeyCode::Enter => {
                     ui.pending = None;
                     ui.session.continue_hand();
                     ui.feedback = None;
                     ui.provider_feedback = false;
                     ui.deep = false;
+                    ui.deep_scroll = 0;
                     ui.status = "Hand resumed".into();
                     next_bot = Instant::now() + Duration::from_millis(450);
                 }
@@ -594,31 +604,66 @@ pub fn run(
                 KeyCode::Esc => ui.input = Input::Play,
                 _ => {}
             },
-            Input::Raise(text) => match code {
+            Input::Raise { amount, typing } => match code {
                 KeyCode::Esc => ui.input = Input::Play,
                 KeyCode::Backspace => {
-                    text.pop();
+                    if *typing {
+                        amount.pop();
+                    } else {
+                        amount.clear();
+                        *typing = true;
+                    }
                 }
-                KeyCode::Char(c) if c.is_ascii_digit() && text.len() < 9 => text.push(c),
+                KeyCode::Char('t') => {
+                    amount.clear();
+                    *typing = true;
+                }
+                KeyCode::Char(c @ '1'..='5') if !*typing => {
+                    if let Ok(observation) = ui.session.observation(hero()) {
+                        *amount =
+                            raise_presets(&observation)[c as usize - '1' as usize].to_string();
+                    }
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() && amount.len() < 9 => {
+                    amount.push(c);
+                    *typing = true;
+                }
                 KeyCode::Up => {
-                    *text = text
-                        .parse::<u32>()
-                        .unwrap_or(0)
-                        .saturating_add(1)
-                        .to_string();
+                    let candidate = amount.parse::<u32>().unwrap_or(0).saturating_add(1);
+                    if let Ok(observation) = ui.session.observation(hero()) {
+                        *amount = clamp_raise(&observation, candidate).to_string();
+                    }
+                    *typing = false;
                 }
                 KeyCode::Down => {
-                    *text = text
-                        .parse::<u32>()
-                        .unwrap_or(0)
-                        .saturating_sub(1)
-                        .to_string();
+                    let candidate = amount.parse::<u32>().unwrap_or(0).saturating_sub(1);
+                    if let Ok(observation) = ui.session.observation(hero()) {
+                        *amount = clamp_raise(&observation, candidate).to_string();
+                    }
+                    *typing = false;
+                }
+                KeyCode::Right => {
+                    let candidate = amount.parse::<u32>().unwrap_or(0).saturating_add(10);
+                    if let Ok(observation) = ui.session.observation(hero()) {
+                        *amount = clamp_raise(&observation, candidate).to_string();
+                    }
+                    *typing = false;
+                }
+                KeyCode::Left => {
+                    let candidate = amount.parse::<u32>().unwrap_or(0).saturating_sub(10);
+                    if let Ok(observation) = ui.session.observation(hero()) {
+                        *amount = clamp_raise(&observation, candidate).to_string();
+                    }
+                    *typing = false;
                 }
                 KeyCode::Enter => {
                     if let Ok(o) = ui.session.observation(hero()) {
-                        match text.parse::<u32>() {
-                            Ok(n) if n == o.legal.all_in_to => ui.input = Input::AllIn,
+                        match amount.parse::<u32>() {
+                            Ok(n) if clamp_raise(&o, n) == o.legal.all_in_to => {
+                                ui.input = Input::AllIn
+                            }
                             Ok(n) => {
+                                let n = clamp_raise(&o, n);
                                 action = Some(if o.legal.min_raise_to.is_some() {
                                     Action::Raise(n)
                                 } else {
@@ -646,8 +691,11 @@ pub fn run(
                         }
                         KeyCode::Char('a') => ui.input = Input::AllIn,
                         KeyCode::Char('r') => {
-                            if o.legal.min_raise_to.or(o.legal.min_bet_to).is_some() {
-                                ui.input = Input::Raise(String::new());
+                            if let Some(minimum) = o.legal.min_raise_to.or(o.legal.min_bet_to) {
+                                ui.input = Input::Raise {
+                                    amount: minimum.to_string(),
+                                    typing: false,
+                                };
                             } else {
                                 ui.status =
                                     "No regular raise available; A reviews an all-in".into();
@@ -693,6 +741,17 @@ pub fn run(
         );
     }
     Ok(())
+}
+
+fn scroll_deep(scroll: &mut u16, code: KeyCode) -> bool {
+    match code {
+        KeyCode::Up => *scroll = scroll.saturating_sub(1),
+        KeyCode::Down => *scroll = scroll.saturating_add(1),
+        KeyCode::PageUp => *scroll = scroll.saturating_sub(8),
+        KeyCode::PageDown => *scroll = scroll.saturating_add(8),
+        _ => return false,
+    }
+    true
 }
 impl Ui {
     fn request(&mut self, store: &Store) {
@@ -837,13 +896,6 @@ fn apply_update_result(ui: &mut Ui, result: Result<UpdateDone, String>) {
 }
 fn replay_available(ui: &Ui) -> bool {
     ui.session.finished() && ui.session.coaching.is_none() && matches!(ui.input, Input::Play)
-}
-fn cards(cards: &[crate::game::deck::Card]) -> String {
-    cards
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("  ")
 }
 fn ui_settings_placeholder() -> Settings {
     Settings::default()
@@ -1055,116 +1107,23 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
         );
         return;
     }
-    let regions = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(7),
-        Constraint::Length(17 - u16::from(ui.session.settings.seats)),
-        Constraint::Length(3),
-    ])
-    .margin(1)
-    .split(area);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    "OPENFELT",
-                    Style::default()
-                        .fg(Color::Rgb(225, 190, 105))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("   Play the hand. Learn the game."),
-            ]),
-            Line::from(format!(
-                "Local play money · {}/{} blinds · {} seats · Rake OFF · {:?}/{:?} opponents",
-                ui.session.settings.small_blind,
-                ui.session.settings.big_blind,
-                ui.session.settings.seats,
-                ui.session.settings.opponents.style,
-                ui.session.settings.opponents.difficulty
-            )),
-        ]),
-        regions[0],
-    );
     let p = ui.session.view();
     let bb = f64::from(ui.session.settings.big_blind);
-    let own = p.seats.iter().find(|s| s.seat == hero()).expect("hero");
-    let mut lines = vec![
-        Line::from(format!(
-            "Hand {} · {} · Pot {} chips / {:.1} BB",
-            ui.session.hand_id,
-            p.phase.name(),
-            p.pot_total,
-            f64::from(p.pot_total) / bb
-        )),
-        Line::from(format!(
-            "Board  {}",
-            if p.board.is_empty() {
-                "—".into()
-            } else {
-                cards(&p.board)
-            }
-        )),
-        Line::from(format!(
-            "Your cards  {}",
-            own.hole_cards
-                .as_ref()
-                .map(|c| cards(c))
-                .unwrap_or_default()
-        )),
-    ];
-    for seat in &p.seats {
-        let name = if seat.seat == hero() {
-            "YOU".into()
-        } else {
-            format!("Bot {}", seat.seat.as_u8())
-        };
-        let position = if seat.seat == p.button {
-            "D"
-        } else if seat.seat == p.small_blind {
-            "SB"
-        } else if seat.seat == p.big_blind {
-            "BB"
-        } else {
-            ""
-        };
-        lines.push(Line::from(format!(
-            "{} {:<6} {:<2} {:>7} chips  {:>6.1} BB   in {:>5}   {:?} {}",
-            if p.to_act == Some(seat.seat) {
-                "›"
-            } else {
-                " "
-            },
-            name,
-            position,
-            seat.stack,
-            f64::from(seat.stack) / bb,
-            seat.street_contribution,
-            seat.participation,
-            if seat.seat != hero() {
-                seat.hole_cards
-                    .as_ref()
-                    .map(|c| cards(c))
-                    .unwrap_or_else(|| "[hidden]".into())
-            } else {
-                String::new()
-            }
-        )));
-    }
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(
-            if ui.session.coaching.is_some() {
-                " TABLE PAUSED "
-            } else {
-                " TABLE "
-            },
-        )),
-        regions[1],
-    );
     let (title, body) = if ui.consent {
         let kind = selected_provider(ui.session.settings.coaching).expect("cloud consent provider");
         (" ENABLE OPTIONAL CLOUD COACHING ",format!("Destination: {}\nModel: {} · credential: {} or OS keychain\nOnly your pre-decision cards, public table/action data and teaching facts leave this device.\nProvider charges and data terms apply. Limit: {} requests / session.\nEnter enables paid coaching this session. Esc or L plays with local teaching.\nNo request is made until you accept a poker decision.",kind.endpoint(),ui.session.settings.cloud.model,kind.environment(),ui.session.settings.cloud.max_requests))
     } else if ui.help {
         (" HOW TO PLAY ","F folds · C checks or calls · R opens bet/raise TO entry in chips.\nEnter submits an amount; arrows adjust by one chip. A asks for all-in confirmation.\nAfter every accepted decision the table pauses: Enter continues, ? expands teaching.\nBetween hands: V browses saved hands; B tops up/rebuys; W withdraws; Enter deals.\nIn replay: arrows browse; B bookmarks; O shows outcome; Esc returns.\nRun openfelt --drill <topic> for a short offline practice set.\nS opens settings. Between hands, Updates can check for a release; it never installs by itself.\nBots use reviewed heuristic ranges, style, and difficulty—not solver strategies.\nSettings and private learning history live in your local OpenFelt data folder.\nQ quits at any time. No timer acts for you.".into())
+    } else if matches!(ui.input, Input::AllIn) {
+        (
+            " CONFIRM ALL-IN ",
+            "Enter commits your remaining stack. Esc cancels.".into(),
+        )
+    } else if let Input::Withdraw(amount) = &ui.input {
+        (
+            " WITHDRAW CHIPS ",
+            format!("Amount: {amount}\nEnter confirms · Esc cancels"),
+        )
     } else if let Some(d) = &ui.session.coaching {
         let explanation = if ui.session.settings.coaching == CoachingMode::Off {
             "Coaching off. Your decision is accepted.".into()
@@ -1178,10 +1137,15 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
                 } else {
                     "local heuristic"
                 },
-                f.explanation
+                humanize_coaching(&f.explanation)
             )
         } else {
             "Coaching unavailable".into()
+        };
+        let explanation = if ui.deep {
+            explanation
+        } else {
+            format!("{}\n… ? read full feedback", excerpt(&explanation, 112))
         };
         let details = if ui.deep {
             format!(
@@ -1198,11 +1162,20 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
         (
             " AFTER YOUR DECISION ",
             format!(
-                "You {}. The visible hand is frozen.\n{}{}\nEnter continues · ? {} · Q quits",
+                "You {}. The visible hand is frozen.\nEnter continues · ? {} · Q quits\n{}{}{}",
                 d.accepted_action.description(),
+                if ui.deep {
+                    "close details"
+                } else {
+                    "read full feedback"
+                },
                 explanation,
                 details,
-                if ui.deep { "less" } else { "details" }
+                if ui.deep {
+                    "\n↑/↓ scroll · PgUp/PgDn page · Esc closes"
+                } else {
+                    ""
+                }
             ),
         )
     } else if ui.session.finished() {
@@ -1211,66 +1184,157 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
             .as_ref()
             .map(|note| format!("\n{note}"))
             .unwrap_or_default();
-        (" HAND COMPLETE ",format!("Session profit: {:+} chips (excludes top-ups and withdrawals).\nLifetime: {} completed hands · {} decisions reviewed.\nEnter next hand · B top up/rebuy to 100BB · W withdraw chips\nBot busts rebuy automatically and are recorded as external chip additions.{practice}",ui.session.session_profit,ui.progress.hands,ui.progress.decisions))
-    } else {
+        (" HAND COMPLETE ",format!("Session profit: {:+} chips (excludes top-ups and withdrawals).\nProgress: {} completed hands · {} decisions reviewed.\nEnter next hand · B top up/rebuy to 100BB · W withdraw chips\nBot busts rebuy automatically and are recorded as external chip additions.{practice}",ui.session.session_profit,ui.progress.hands,ui.progress.decisions))
+    } else if p.to_act == Some(hero()) {
         (
             " YOUR NEXT DECISION ",
-            if p.to_act == Some(hero()) {
-                format!("Your turn. {}\nF fold · C check/call · R bet/raise TO · A all-in\nTake your time. Coaching appears after your choice. ? opens help.",ui.session.observation(hero()).map(|o|format!("Call costs {} chips / {:.1} BB.",o.call_cost(),f64::from(o.call_cost())/bb)).unwrap_or_default())
-            } else {
-                "Opponents are acting…\nOnly each opponent's own cards and public information inform its choice.".into()
-            },
-        )
-    };
-    let panel = if ui.deep || ui.help || ui.consent {
-        ratatui::layout::Rect {
-            x: regions[1].x,
-            y: regions[1].y,
-            width: regions[1].width,
-            height: regions[1].height + regions[2].height,
-        }
-    } else {
-        regions[2]
-    };
-    frame.render_widget(ratatui::widgets::Clear, panel);
-    frame.render_widget(
-        Paragraph::new(body)
-            .style(base)
-            .wrap(Wrap { trim: true })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .border_style(Style::default().fg(Color::Rgb(78, 151, 131))),
-            ),
-        panel,
-    );
-    let input = match &ui.input {
-        Input::Play => ui.status.clone(),
-        Input::AllIn => "ALL-IN: Enter commits your remaining stack. Esc cancels.".into(),
-        Input::Withdraw(s) => format!("Withdraw chips: {s} · Enter confirms · Esc cancels"),
-        Input::Raise(s) => {
-            let bounds = ui
-                .session
+            format!(
+                "{}\n{}",
+                ui.session
                 .observation(hero())
-                .ok()
                 .map(|o| {
                     format!(
-                        "{}–{}",
-                        o.legal.min_raise_to.or(o.legal.min_bet_to).unwrap_or(0),
-                        o.legal.all_in_to
+                        "Call costs {} chips / {:.1} BB.\nTake your time. Coaching appears after your choice.",
+                        o.call_cost(),
+                        f64::from(o.call_cost()) / bb
                     )
                 })
-                .unwrap_or_default();
-            format!("Bet/raise TO (total street chips) [{bounds}]: {s} · Enter · Esc")
-        }
+                .unwrap_or_else(|_| ui.status.clone()),
+                ui.status
+            ),
+        )
+    } else {
+        (
+            " TABLE STATUS ",
+            format!(
+                "Opponents are acting. Hidden cards stay private.\n{}",
+                ui.status
+            ),
+        )
     };
-    frame.render_widget(
-        Paragraph::new(input)
-            .wrap(Wrap { trim: true })
-            .style(Style::default().fg(Color::Rgb(225, 190, 105))),
-        regions[3],
+    let mode = if ui.session.coaching.is_some() {
+        super::table_ui::TableMode::Paused
+    } else if ui.session.finished() {
+        super::table_ui::TableMode::Complete
+    } else {
+        super::table_ui::TableMode::Playing
+    };
+    let raise = match &ui.input {
+        Input::Raise { amount, .. } => ui
+            .session
+            .observation(hero())
+            .ok()
+            .map(|observation| raise_view(&observation, amount)),
+        _ => None,
+    };
+    let actions = ui.session.recent_actions();
+    super::table_ui::render(
+        frame,
+        &super::table_ui::TableRenderState {
+            projection: &p,
+            hero: hero(),
+            hand_id: ui.session.hand_id,
+            recent_actions: &actions,
+            status: &ui.status,
+            mode,
+            notice_title: Some(title.trim()),
+            notice: Some(&body),
+            raise,
+        },
     );
+
+    if ui.help || ui.consent {
+        let panel = ratatui::layout::Rect {
+            x: area.x + 5,
+            y: area.y + 4,
+            width: area.width.saturating_sub(10),
+            height: area.height.saturating_sub(8),
+        };
+        frame.render_widget(ratatui::widgets::Clear, panel);
+        frame.render_widget(
+            Paragraph::new(body)
+                .style(base)
+                .wrap(Wrap { trim: true })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(title)
+                        .border_style(Style::default().fg(Color::Rgb(78, 151, 131))),
+                ),
+            panel,
+        );
+    } else if ui.deep && ui.session.coaching.is_some() {
+        super::table_ui::render_coaching_details(frame, title, &body, ui.deep_scroll);
+    }
+}
+
+fn raise_view(observation: &super::facts::Observation, text: &str) -> super::table_ui::RaiseView {
+    let minimum = observation
+        .legal
+        .min_raise_to
+        .or(observation.legal.min_bet_to)
+        .unwrap_or(observation.legal.all_in_to);
+    let maximum = observation.legal.all_in_to;
+    let amount = text
+        .parse::<u32>()
+        .unwrap_or(minimum)
+        .clamp(minimum, maximum);
+    super::table_ui::RaiseView {
+        amount,
+        minimum,
+        maximum,
+        presets: raise_presets(observation),
+    }
+}
+
+fn clamp_raise(observation: &super::facts::Observation, amount: u32) -> u32 {
+    let minimum = observation
+        .legal
+        .min_raise_to
+        .or(observation.legal.min_bet_to)
+        .unwrap_or(observation.legal.all_in_to);
+    amount.clamp(minimum, observation.legal.all_in_to)
+}
+
+fn raise_presets(observation: &super::facts::Observation) -> [u32; 5] {
+    let minimum = observation
+        .legal
+        .min_raise_to
+        .or(observation.legal.min_bet_to)
+        .unwrap_or(observation.legal.all_in_to);
+    let maximum = observation.legal.all_in_to;
+    let base = observation.pot.saturating_add(observation.call_cost());
+    let wager = observation.wager;
+    let target = |numerator: u32, denominator: u32| {
+        wager
+            .saturating_add(base.saturating_mul(numerator).div_ceil(denominator))
+            .clamp(minimum, maximum)
+    };
+    [
+        minimum,
+        target(1, 2),
+        target(3, 4),
+        target(1, 1),
+        target(3, 2),
+    ]
+}
+
+fn humanize_coaching(copy: &str) -> String {
+    copy.replace("LateOpen", "late-position range")
+        .replace("Premium", "premium range")
+        .replace("Strong", "strong range")
+        .replace("Marginal", "marginal range")
+        .replace("Fold", "folding range")
+}
+
+fn excerpt(copy: &str, limit: usize) -> String {
+    let mut chars = copy.chars();
+    let excerpt = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        format!("{}…", excerpt.trim_end())
+    } else {
+        excerpt
+    }
 }
 
 #[cfg(test)]
@@ -1288,6 +1352,7 @@ mod tests {
             pending: None,
             status: "Ready".into(),
             deep: false,
+            deep_scroll: 0,
             help: false,
             consent: false,
             cloud_enabled: false,
@@ -1326,8 +1391,8 @@ mod tests {
         for seats in [2, 6, 9] {
             let ui = ui(seats);
             let text = rendered(&ui, 80, 30);
-            assert!(text.contains(&format!("Bot {}", seats - 1)));
-            assert!(text.contains("YOUR NEXT DECISION"));
+            assert!(text.contains(&format!("bot {}", seats - 1)));
+            assert!(text.contains("ACTION"));
             assert!(text.contains("Ready"));
         }
         let text = rendered(&ui(6), 60, 20);
@@ -1474,12 +1539,70 @@ mod tests {
         let d = ui.session.submit(action).unwrap();
         ui.feedback = Some(local_feedback(d));
         let text = rendered(&ui, 80, 30);
-        assert!(text.contains("TABLE PAUSED"));
-        assert!(text.contains("Enter continues"));
+        assert!(text.contains("HAND PAUSED"));
+        assert!(text.contains("ENTER TO CONTINUE"));
         ui.deep = true;
         let text = rendered(&ui, 80, 30);
         assert!(text.contains("Legal call:"));
+        assert!(text.contains("Contestable pot assumes"));
         assert!(text.contains("Enter continues"));
         assert!(!text.contains("[hidden]"));
+
+        ui.feedback.as_mut().unwrap().explanation = format!(
+            "{} FULL_FEEDBACK_TAIL",
+            "A deliberately long coaching explanation with concrete strategic context. ".repeat(30)
+        );
+        let text = rendered(&ui, 80, 30);
+        assert!(!text.contains("FULL_FEEDBACK_TAIL"));
+        for _ in 0..20 {
+            assert!(scroll_deep(&mut ui.deep_scroll, KeyCode::PageDown));
+        }
+        let text = rendered(&ui, 80, 30);
+        assert!(text.contains("FULL_FEEDBACK_TAIL"));
+        let scrolled = ui.deep_scroll;
+        assert!(scroll_deep(&mut ui.deep_scroll, KeyCode::Up));
+        assert_eq!(ui.deep_scroll, scrolled - 1);
+        assert!(scroll_deep(&mut ui.deep_scroll, KeyCode::PageUp));
+        assert_eq!(ui.deep_scroll, scrolled - 9);
+    }
+
+    #[test]
+    fn confirmation_and_edit_modes_are_visible_on_the_live_table() {
+        let mut ui = ui(2);
+        while ui.session.view().to_act != Some(hero()) {
+            ui.session.step_bot().unwrap();
+        }
+        ui.input = Input::AllIn;
+        let screen = rendered(&ui, 80, 30);
+        assert!(screen.contains("CONFIRM ALL-IN"));
+        assert!(screen.contains("Esc"));
+        assert!(screen.contains("cancels"));
+
+        ui.input = Input::Withdraw("125".into());
+        let screen = rendered(&ui, 80, 30);
+        assert!(screen.contains("WITHDRAW CHIPS"));
+        assert!(screen.contains("Amount: 125"));
+    }
+
+    #[test]
+    fn raise_display_and_submission_share_clamped_amounts() {
+        let mut ui = ui(6);
+        while ui.session.view().to_act != Some(hero()) {
+            ui.session.step_bot().unwrap();
+        }
+        let observation = ui.session.observation(hero()).unwrap();
+        let minimum = observation
+            .legal
+            .min_raise_to
+            .or(observation.legal.min_bet_to)
+            .unwrap();
+        let maximum = observation.legal.all_in_to;
+        assert_eq!(raise_view(&observation, "0").amount, minimum);
+        assert_eq!(clamp_raise(&observation, 0), minimum);
+        assert_eq!(raise_view(&observation, "999999").amount, maximum);
+        assert_eq!(clamp_raise(&observation, 999_999), maximum);
+        assert!(raise_presets(&observation)
+            .into_iter()
+            .all(|amount| (minimum..=maximum).contains(&amount)));
     }
 }

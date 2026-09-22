@@ -37,7 +37,7 @@ private runtime state and historical screenshot/checkpoint bundles are excluded.
   existing ignored; locked release build and strict Clippy passed.
 - Live direct TLS Host/Join, waiting more than 30 seconds before a second terminal
   joins, reconnect and completed tournament verified on Windows against Linux.
-- Quality CI now includes Apple Silicon macOS, Intel macOS, Windows and Linux.
+- Quality CI includes Apple Silicon macOS, Windows x86_64, and Linux x86_64. Intel macOS is deprecated.
   Remote results are reported on the PR; real Mac terminal/network smoke remains
   pending regardless of compilation results.
 
