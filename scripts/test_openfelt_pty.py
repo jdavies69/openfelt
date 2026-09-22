@@ -106,6 +106,14 @@ with tempfile.TemporaryDirectory(prefix="openfelt-pty-") as root:
     g.send("\r")
     g.send("B")
     g.send("w5\r")
+    g.send("v")
+    assert b"COMPLETED HANDS" in ANSI.sub(b"", g.output), "V must open replay between hands"
+    g.send("\r")
+    assert b"DECISION REPLAY" in ANSI.sub(b"", g.output)
+    g.send("b")
+    assert b"BOOKMARKED" in ANSI.sub(b"", g.output)
+    g.send("\x1b\x1b")
+    assert g.process.poll() is None, "replay must return to the same live session"
     g.quit()
     cash = [json.loads(line) for line in (g.root / "cash-events.jsonl").read_text().splitlines()]
     assert cash[0]["added"] == 1 and cash[1]["withdrawn"] == 5, cash
@@ -113,7 +121,18 @@ with tempfile.TemporaryDirectory(prefix="openfelt-pty-") as root:
     assert progress["hands"] == 1 and progress["profit_chips"] == -1, progress
     output = subprocess.check_output([str(BINARY), "--data-dir", str(g.root), "--stats"], text=True)
     assert "1 hands" in output and "1 decisions" in output
-    print("PASS: invalid raise, all-in cancellation, resize, rebuy/withdrawal ledger, restart stats")
+    bookmarks = json.loads((g.root / "bookmarks.json").read_text())
+    assert len(bookmarks) == 1 and bookmarks[0]["decision"] == 0, bookmarks
+    print("PASS: invalid actions, resize, cash ledger, in-app replay/bookmark, restart stats")
+
+    g = Game(Path(root) / "settings-menu")
+    g.send("s")
+    assert b"SETTINGS" in ANSI.sub(b"", g.output), "S must open settings"
+    g.send("\x1b")
+    g.send("f")
+    assert len(g.decisions()) == 1, "closing settings must return to the same playable session"
+    g.quit()
+    print("PASS: settings opens and safely returns to the live table")
 
     g = Game(Path(root) / "missing-key", "--coaching", "openai", "--model", "fixture-model")
     assert b"ENABLE OPTIONAL CLOUD COACHING" in ANSI.sub(b"", g.output)
