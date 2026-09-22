@@ -35,7 +35,7 @@ struct Args {
     mistake_rate: Option<f64>,
     #[arg(long, value_enum)]
     coaching: Option<CoachingMode>,
-    /// OpenAI model ID; use a model supporting Responses structured output.
+    /// Provider model ID; use a model supported by the selected coaching adapter.
     #[arg(long)]
     model: Option<String>,
     #[arg(long)]
@@ -66,6 +66,25 @@ struct Args {
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let explicit_setup = args.seats.is_some()
+        || args.small_blind.is_some()
+        || args.big_blind.is_some()
+        || args.opponents.is_some()
+        || args.opponent_style.is_some()
+        || args.opponent_difficulty.is_some()
+        || args.aggression.is_some()
+        || args.bluff_rate.is_some()
+        || args.mistake_rate.is_some()
+        || args.coaching.is_some()
+        || args.model.is_some()
+        || args.max_requests.is_some()
+        || args.max_output_tokens.is_some()
+        || args.timeout_seconds.is_some()
+        || args.input_usd_per_million.is_some()
+        || args.output_usd_per_million.is_some()
+        || args.budget_usd.is_some()
+        || args.pricing_as_of.is_some()
+        || args.save_settings;
     let store = match args.data_dir {
         Some(root) => Store { root },
         None => Store::default_location()?,
@@ -106,6 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+    let first_run = !store.has_settings() && !explicit_setup;
     let mut s = store.settings()?;
     if let Some(v) = args.seats {
         s.seats = v;
@@ -171,5 +191,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         previous(info);
     }));
-    tui::run(s, store)
+    tui::run(s, store, first_run)
 }

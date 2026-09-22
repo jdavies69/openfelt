@@ -1,8 +1,47 @@
-//! Optional direct OpenAI Responses adapter. No credentials in Debug, settings, prompts or errors.
+//! Optional direct provider adapters. No credentials in Debug, settings, prompts or errors.
 use super::facts::{Decision, Feedback};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{sync::mpsc, time::Duration};
+
+pub const KEYRING_SERVICE: &str = "dev.openfelt.coaching";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Provider {
+    Openai,
+    Anthropic,
+}
+impl Provider {
+    pub const fn account(self) -> &'static str {
+        match self {
+            Self::Openai => "openai-api-key",
+            Self::Anthropic => "anthropic-api-key",
+        }
+    }
+    pub const fn environment(self) -> &'static str {
+        match self {
+            Self::Openai => "OPENAI_API_KEY",
+            Self::Anthropic => "ANTHROPIC_API_KEY",
+        }
+    }
+    pub const fn endpoint(self) -> &'static str {
+        match self {
+            Self::Openai => "https://api.openai.com/v1/responses",
+            Self::Anthropic => "https://api.anthropic.com/v1/messages",
+        }
+    }
+    pub const fn models(self) -> &'static [&'static str] {
+        match self {
+            Self::Openai => &["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-5"],
+            Self::Anthropic => &[
+                "claude-haiku-4-5-20251001",
+                "claude-sonnet-5",
+                "claude-opus-5",
+            ],
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -74,11 +113,16 @@ impl ProviderSettings {
     }
 }
 
+#[derive(Clone)]
 pub struct Credential(String);
 impl Credential {
-    pub fn from_environment() -> Result<Self, String> {
-        let key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| "OPENAI_API_KEY is missing; local play remains available")?;
+    pub fn from_environment(provider: Provider) -> Result<Self, String> {
+        let key = std::env::var(provider.environment()).map_err(|_| {
+            format!(
+                "{} is missing; local play remains available",
+                provider.environment()
+            )
+        })?;
         Self::new(key)
     }
     pub fn new(key: String) -> Result<Self, String> {
@@ -87,6 +131,84 @@ impl Credential {
         }
         Ok(Self(key))
     }
+}
+
+pub trait CredentialStore {
+    fn get(&self, provider: Provider) -> Result<Option<Credential>, String>;
+    fn set(&self, provider: Provider, credential: Credential) -> Result<(), String>;
+    fn delete(&self, provider: Provider) -> Result<(), String>;
+}
+
+pub struct SystemKeyring;
+impl SystemKeyring {
+    fn entry(provider: Provider) -> Result<keyring::Entry, String> {
+        keyring::Entry::new(KEYRING_SERVICE, provider.account())
+            .map_err(|_| "Cannot access the operating-system credential store".into())
+    }
+}
+impl CredentialStore for SystemKeyring {
+    fn get(&self, provider: Provider) -> Result<Option<Credential>, String> {
+        match Self::entry(provider)?.get_password() {
+            Ok(value) => Credential::new(value).map(Some),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(_) => Err("Cannot read the saved coaching credential".into()),
+        }
+    }
+    fn set(&self, provider: Provider, credential: Credential) -> Result<(), String> {
+        Self::entry(provider)?
+            .set_password(&credential.0)
+            .map_err(|_| "Cannot save the coaching credential".into())
+    }
+    fn delete(&self, provider: Provider) -> Result<(), String> {
+        match Self::entry(provider)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(_) => Err("Cannot forget the coaching credential".into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSource {
+    Cli,
+    Environment,
+    Keyring,
+    Missing,
+}
+
+pub fn resolve_credential(
+    provider: Provider,
+    cli: Option<String>,
+    keyring: &dyn CredentialStore,
+) -> Result<(Option<Credential>, CredentialSource), String> {
+    if let Some(value) = cli {
+        return Credential::new(value).map(|v| (Some(v), CredentialSource::Cli));
+    }
+    if let Ok(value) = std::env::var(provider.environment()) {
+        return Credential::new(value).map(|v| (Some(v), CredentialSource::Environment));
+    }
+    Ok(match keyring.get(provider)? {
+        Some(value) => (Some(value), CredentialSource::Keyring),
+        None => (None, CredentialSource::Missing),
+    })
+}
+
+pub fn mask_credential(value: &str, reveal: bool) -> String {
+    if reveal {
+        return value.to_owned();
+    }
+    let suffix: String = value
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let prefix = value
+        .split_once('-')
+        .map(|(prefix, _)| format!("{prefix}-"))
+        .unwrap_or_default();
+    format!("{prefix}••••••••{suffix}")
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -137,6 +259,74 @@ pub struct Pending {
     receiver: mpsc::Receiver<Result<ProviderResult, String>>,
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
 }
+pub struct CredentialTest {
+    receiver: mpsc::Receiver<Result<(), String>>,
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+}
+impl CredentialTest {
+    pub fn poll(&self) -> Option<Result<(), String>> {
+        self.receiver.try_recv().ok()
+    }
+}
+impl Drop for CredentialTest {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+pub fn test_credential(
+    provider: Provider,
+    settings: ProviderSettings,
+    key: Credential,
+    usage: &mut Usage,
+) -> Result<CredentialTest, String> {
+    settings.validate()?;
+    if settings.model.is_empty() {
+        return Err("Choose a model before testing the key".into());
+    }
+    let body = match provider {
+        Provider::Openai => {
+            json!({"model":settings.model,"store":false,"max_output_tokens":16,"input":"Reply with OK."})
+        }
+        Provider::Anthropic => {
+            json!({"model":settings.model,"max_tokens":8,"messages":[{"role":"user","content":"Reply with OK."}]})
+        }
+    };
+    let request_bytes = serde_json::to_vec(&body).map_err(|_| "Cannot encode key test")?;
+    usage.reserve(&settings, request_bytes.len())?;
+    let (sender, receiver) = mpsc::channel();
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let result = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(runtime) => runtime.block_on(async { tokio::select! {
+                _ = cancel_rx => Err("Key test cancelled".into()),
+                result = async {
+                    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+                        .no_proxy().timeout(Duration::from_secs(settings.timeout_seconds)).build()
+                        .map_err(|_| "Cannot initialize coaching connection")?;
+                    let request = client.post(provider.endpoint()).json(&body);
+                    let request = match provider {
+                        Provider::Openai => request.bearer_auth(&key.0),
+                        Provider::Anthropic => request.header("x-api-key", &key.0).header("anthropic-version", "2023-06-01"),
+                    };
+                    let response = request.send().await.map_err(|_| "Key test failed: connection failed or timed out")?;
+                    if response.status().is_success() { Ok(()) } else { Err(match response.status().as_u16() {
+                        401 | 403 => "Key test failed: authentication rejected",
+                        429 => "Key test failed: rate limit or credit exhausted",
+                        _ => "Key test failed: provider error",
+                    }.into()) }
+                } => result,
+            }}),
+            Err(_) => Err("Cannot start key test".into()),
+        };
+        let _ = sender.send(result);
+    });
+    Ok(CredentialTest {
+        receiver,
+        cancel: Some(cancel_tx),
+    })
+}
 impl Pending {
     pub fn poll(&self) -> Option<Result<ProviderResult, String>> {
         match self.receiver.try_recv() {
@@ -156,15 +346,16 @@ impl Drop for Pending {
 
 pub fn start(
     d: Decision,
+    provider: Provider,
     settings: ProviderSettings,
     key: Credential,
     usage: &mut Usage,
 ) -> Result<Pending, String> {
     settings.validate()?;
     if settings.model.is_empty() {
-        return Err("Choose an OpenAI model before enabling cloud coaching".into());
+        return Err("Choose a model before enabling cloud coaching".into());
     }
-    let body = request_body(&d, &settings);
+    let body = request_body_for(provider, &d, &settings);
     let bytes = serde_json::to_vec(&body).map_err(|_| "Cannot encode coaching request")?;
     if bytes.len() > 64_000 {
         return Err("Coaching request exceeds the local size limit".into());
@@ -176,7 +367,7 @@ pub fn start(
         let result=match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(runtime)=>runtime.block_on(async {tokio::select! {
                 _=cancel_rx=>Err("Coaching cancelled".into()),
-                result=send_request("https://api.openai.com/v1/responses",&d,&settings,&key,body)=>result,
+                result=send_request(provider,provider.endpoint(),&d,&settings,&key,body)=>result,
             }}),Err(_)=>Err("Cannot start coaching worker".into())
         };
         let _ = sender.send(result);
@@ -188,17 +379,29 @@ pub fn start(
 }
 
 pub fn request_body(d: &Decision, s: &ProviderSettings) -> Value {
+    request_body_for(Provider::Openai, d, s)
+}
+pub fn request_body_for(provider: Provider, d: &Decision, s: &ProviderSettings) -> Value {
     let schema = json!({"type":"object","additionalProperties":false,"properties":{
         "version":{"type":"integer","enum":[1]},"hand_id":{"type":"integer"},"revision":{"type":"integer"},
         "assessment":{"type":"string","enum":["uncertain","reasonable","reconsider"]},"explanation":{"type":"string"},"concept":{"type":"string"},
         "assumptions":{"type":"array","items":{"type":"string"}},"evidence_basis":{"type":"string","enum":["heuristic"]},"alternative_action":{"type":["string","null"],"enum":["fold","check_call","raise",null]}},
         "required":["version","hand_id","revision","assessment","explanation","concept","assumptions","evidence_basis","alternative_action"]});
-    json!({"model":s.model,"store":false,"max_output_tokens":s.max_output_tokens,
-        "instructions":"You teach a beginner local play-money Hold'em after an accepted decision. Use only this pre-decision observation. Teach one concept briefly. Copy hand_id/revision from observation. Label all strategic advice heuristic. Several choices may be reasonable: use uncertain when information is insufficient. Do not infer hidden cards or future outcomes. Do not state numeric equity, EV, odds, frequencies, amounts, percentages, or solver/GTO optimality: verified numbers are displayed separately by the app. Do not use digits in explanation, concept, assumptions or alternative_action. No tools. Return the required JSON only.",
+    let instruction = "You teach a beginner local play-money Hold'em after an accepted decision. Use only this pre-decision observation. Teach one concept briefly. Copy hand_id/revision from observation. Label all strategic advice heuristic. Several choices may be reasonable: use uncertain when information is insufficient. Do not infer hidden cards or future outcomes. Do not state numeric equity, EV, odds, frequencies, amounts, percentages, or solver/GTO optimality: verified numbers are displayed separately by the app. Do not use digits in explanation, concept, assumptions or alternative_action. No tools. Return the required JSON only.";
+    match provider {
+        Provider::Openai => {
+            json!({"model":s.model,"store":false,"max_output_tokens":s.max_output_tokens,
+        "instructions":instruction,
         "input":serde_json::to_string(d).expect("serializable decision"),"text":{"format":{"type":"json_schema","name":"openfelt_feedback","strict":true,"schema":schema}}})
+        }
+        Provider::Anthropic => json!({"model":s.model,"max_tokens":s.max_output_tokens,
+        "system":instruction,"messages":[{"role":"user","content":serde_json::to_string(d).expect("serializable decision")}],
+        "output_config":{"format":{"type":"json_schema","schema":schema}}}),
+    }
 }
 
 async fn send_request(
+    provider: Provider,
     endpoint: &str,
     d: &Decision,
     s: &ProviderSettings,
@@ -211,10 +414,14 @@ async fn send_request(
         .timeout(Duration::from_secs(s.timeout_seconds))
         .build()
         .map_err(|_| "Cannot initialize coaching connection")?;
-    let response = client
-        .post(endpoint)
-        .bearer_auth(&key.0)
-        .json(&body)
+    let request = client.post(endpoint).json(&body);
+    let request = match provider {
+        Provider::Openai => request.bearer_auth(&key.0),
+        Provider::Anthropic => request
+            .header("x-api-key", &key.0)
+            .header("anthropic-version", "2023-06-01"),
+    };
+    let response = request
         .send()
         .await
         .map_err(|_| "Coaching unavailable: connection failed or timed out")?;
@@ -240,9 +447,17 @@ async fn send_request(
         }
         bytes.extend(chunk);
     }
-    parse_response(&bytes, d, &key.0)
+    parse_response_for(provider, &bytes, d, &key.0)
 }
 pub fn parse_response(bytes: &[u8], d: &Decision, secret: &str) -> Result<ProviderResult, String> {
+    parse_response_for(Provider::Openai, bytes, d, secret)
+}
+pub fn parse_response_for(
+    provider: Provider,
+    bytes: &[u8],
+    d: &Decision,
+    secret: &str,
+) -> Result<ProviderResult, String> {
     if bytes.len() > 64_000 {
         return Err("Coaching response exceeds size limit".into());
     }
@@ -251,19 +466,30 @@ pub fn parse_response(bytes: &[u8], d: &Decision, secret: &str) -> Result<Provid
     }
     let value: Value =
         serde_json::from_slice(bytes).map_err(|_| "Coaching unavailable: invalid response")?;
-    if value["status"] != "completed" {
+    if provider == Provider::Openai && value["status"] != "completed" {
         return Err("Coaching unavailable: incomplete or refused response".into());
     }
-    let text = value["output"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|v| v["type"] == "message")
-        .flat_map(|m| m["content"].as_array().into_iter().flatten())
-        .filter(|v| v["type"] == "output_text")
-        .filter_map(|v| v["text"].as_str())
-        .collect::<Vec<_>>()
-        .join("");
+    let text = if provider == Provider::Openai {
+        value["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|v| v["type"] == "message")
+            .flat_map(|m| m["content"].as_array().into_iter().flatten())
+            .filter(|v| v["type"] == "output_text")
+            .filter_map(|v| v["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("")
+    } else {
+        value["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|v| v["type"] == "text")
+            .filter_map(|v| v["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("")
+    };
     let object: Value = serde_json::from_str(&text)
         .map_err(|_| "Coaching unavailable: response schema mismatch")?;
     if !object
@@ -348,6 +574,69 @@ mod tests {
         let action = s.observation(crate::trainer::hero()).unwrap().check_call();
         s.submit(action).unwrap().clone()
     }
+    #[derive(Default)]
+    struct MemoryStore(std::sync::Mutex<Option<String>>);
+    impl CredentialStore for MemoryStore {
+        fn get(&self, _: Provider) -> Result<Option<Credential>, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .clone()
+                .map(Credential::new)
+                .transpose()
+        }
+        fn set(&self, _: Provider, credential: Credential) -> Result<(), String> {
+            *self.0.lock().unwrap() = Some(credential.0);
+            Ok(())
+        }
+        fn delete(&self, _: Provider) -> Result<(), String> {
+            *self.0.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+    #[test]
+    fn credential_mask_models_and_store_contract() {
+        assert_eq!(mask_credential("sk-exampleabcd", false), "sk-••••••••abcd");
+        assert_eq!(mask_credential("sk-exampleabcd", true), "sk-exampleabcd");
+        assert!(Provider::Openai.models().contains(&"gpt-5"));
+        assert!(Provider::Anthropic
+            .models()
+            .contains(&"claude-haiku-4-5-20251001"));
+        let store = MemoryStore::default();
+        store
+            .set(
+                Provider::Openai,
+                Credential::new("stored-secret".into()).unwrap(),
+            )
+            .unwrap();
+        let (value, source) =
+            resolve_credential(Provider::Openai, Some("cli-secret".into()), &store).unwrap();
+        assert_eq!(source, CredentialSource::Cli);
+        assert_eq!(value.unwrap().0, "cli-secret");
+        store.delete(Provider::Openai).unwrap();
+        assert!(store.get(Provider::Openai).unwrap().is_none());
+    }
+    #[test]
+    fn anthropic_body_and_response_keep_the_same_feedback_boundary() {
+        let d = decision();
+        let f = crate::trainer::facts::local_feedback(&d);
+        let settings = ProviderSettings {
+            model: "fixture-model".into(),
+            ..Default::default()
+        };
+        let body = request_body_for(Provider::Anthropic, &d, &settings);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        let response = json!({"content":[{"type":"text","text":serde_json::to_string(&f).unwrap()}],"usage":{"input_tokens":7,"output_tokens":9}});
+        let result = parse_response_for(
+            Provider::Anthropic,
+            &serde_json::to_vec(&response).unwrap(),
+            &d,
+            "fixture-key",
+        )
+        .unwrap();
+        assert_eq!((result.input_tokens, result.output_tokens), (7, 9));
+    }
     fn server(
         status: u16,
         body: String,
@@ -411,6 +700,7 @@ mod tests {
             };
             let key = Credential::new("fake-canary-key".into()).unwrap();
             let result = runtime.block_on(send_request(
+                Provider::Openai,
                 &endpoint,
                 &d,
                 &settings,
@@ -450,6 +740,7 @@ mod tests {
         let start = std::time::Instant::now();
         assert!(runtime
             .block_on(send_request(
+                Provider::Openai,
                 &endpoint,
                 &d,
                 &settings,

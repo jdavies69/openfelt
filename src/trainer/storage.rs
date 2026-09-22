@@ -28,6 +28,7 @@ pub enum CoachingMode {
     Local,
     Off,
     Openai,
+    Anthropic,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -93,6 +94,9 @@ impl Store {
     }
     pub fn settings(&self) -> Result<Settings, String> {
         self.load("settings.json")
+    }
+    pub fn has_settings(&self) -> bool {
+        self.root.join("settings.json").is_file()
     }
     pub fn progress(&self) -> Result<Progress, String> {
         self.load("progress.json")
