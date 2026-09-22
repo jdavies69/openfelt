@@ -120,13 +120,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 false,
             );
             let deep = format!(
-                "{}\nLegal call: {} chips. Contestable pot after call: {} chips.\n{}",
+                "{}\nTOPIC  {}\nLegal call: {} chips. Contestable pot after call: {} chips.\n{}",
                 structured_coaching_copy(
                     decision,
                     &explanation,
                     feedback.alternative_action.as_deref(),
                     true,
                 ),
+                feedback.concept,
                 decision.facts.call_cost,
                 decision.facts.contestable_pot_after_call,
                 decision.facts.assumptions[0],

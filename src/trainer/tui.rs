@@ -560,8 +560,7 @@ pub fn run(
         }
         if code == KeyCode::Char('?') {
             if ui.session.coaching.is_some() {
-                ui.deep = !ui.deep;
-                ui.deep_scroll = 0;
+                toggle_coaching_details(&mut ui);
             } else {
                 ui.help = !ui.help;
             }
@@ -1144,17 +1143,17 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
         let explanation = if ui.session.settings.coaching == CoachingMode::Off {
             "Coaching off. Your decision is accepted.".into()
         } else if let Some(f) = &ui.feedback {
-            if ui.deep {
-                format!("{}\n{}", f.concept, humanize_coaching(&f.explanation))
-            } else {
-                collapsed_coaching_explanation(f)
-            }
+            coaching_explanation(f)
         } else {
             "Coaching unavailable".into()
         };
         let details = if ui.deep {
             format!(
-                "\n{} · {}\nLegal call: {} chips. Contestable pot after call: {} chips.\n{}",
+                "\nTOPIC  {}\n{} · {}\nLegal call: {} chips. Contestable pot after call: {} chips.\n{}",
+                ui.feedback
+                    .as_ref()
+                    .map(|feedback| normalize_paragraph(&feedback.concept))
+                    .unwrap_or_else(|| "General decision review".into()),
                 d.facts.position,
                 d.facts.hand_classification,
                 d.facts.call_cost,
@@ -1398,44 +1397,47 @@ pub fn structured_coaching_copy(
     decision: &super::facts::Decision,
     explanation: &str,
     alternative: Option<&str>,
-    deep: bool,
+    _deep: bool,
 ) -> String {
     format!(
-        "BEFORE ACTION  pot {} · stack {}  ·  YOUR ACTION  {}\nWHY  {}\nCONSIDER  {}{}",
+        "BEFORE ACTION  pot {} · stack {}  ·  YOUR ACTION  {}\nWHY  {}\nCONSIDER  {}",
         decision.observation.pot,
         decision.observation.own().stack,
         accepted_action_copy(&decision.accepted_action),
         explanation,
         alternative.unwrap_or("Review the price, position, and remaining stacks."),
-        if deep {
-            "\nFull reasoning shown above."
-        } else {
-            ""
-        },
     )
 }
 
 pub fn humanize_coaching(copy: &str) -> String {
-    copy.replace("LateOpen", "late-position range")
-        .replace("Late", "late-position")
-        .replace("Premium", "premium range")
-        .replace("Strong", "strong range")
-        .replace("Marginal", "marginal range")
-        .replace("Fold", "folding range")
+    normalize_paragraph(
+        &copy
+            .replace("LateOpen", "late-position range")
+            .replace("Late", "late-position")
+            .replace("Premium", "premium range")
+            .replace("Strong", "strong range")
+            .replace("Marginal", "marginal range")
+            .replace("Fold", "folding range"),
+    )
 }
 
+pub fn coaching_explanation(feedback: &Feedback) -> String {
+    humanize_coaching(&feedback.explanation)
+}
+
+/// Compatibility alias for render-preview callers. Compact clipping is owned
+/// by the renderer so this returns the same full explanation as details.
 pub fn collapsed_coaching_explanation(feedback: &Feedback) -> String {
-    excerpt(&humanize_coaching(&feedback.explanation), 46)
+    coaching_explanation(feedback)
 }
 
-fn excerpt(copy: &str, limit: usize) -> String {
-    let mut chars = copy.chars();
-    let excerpt = chars.by_ref().take(limit).collect::<String>();
-    if chars.next().is_some() {
-        format!("{}…", excerpt.trim_end())
-    } else {
-        excerpt
-    }
+fn normalize_paragraph(copy: &str) -> String {
+    copy.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn toggle_coaching_details(ui: &mut Ui) {
+    ui.deep = !ui.deep;
+    ui.deep_scroll = 0;
 }
 
 #[cfg(test)]
@@ -1743,6 +1745,58 @@ mod tests {
         assert_eq!(ui.deep_scroll, scrolled - 1);
         assert!(scroll_deep(&mut ui.deep_scroll, KeyCode::PageUp));
         assert_eq!(ui.deep_scroll, scrolled - 9);
+    }
+
+    #[test]
+    fn compact_and_expanded_coaching_share_reasoning_without_side_effects() {
+        let mut ui = ui(6);
+        while ui.session.view().to_act != Some(hero()) {
+            ui.session.step_bot().unwrap();
+        }
+        let action = ui.session.observation(hero()).unwrap().check_call();
+        let decision = ui.session.submit(action).unwrap();
+        let mut feedback = local_feedback(decision);
+        feedback.explanation = format!(
+            "First line explains the price.\n\n{}REASONING_TAIL",
+            "Second line preserves the positional reason and adds enough context. ".repeat(4)
+        );
+        feedback.alternative_action =
+            Some("ALTERNATIVE_SENTINEL: fold and preserve the stack.".into());
+        let expected = coaching_explanation(&feedback);
+        assert_eq!(expected, collapsed_coaching_explanation(&feedback));
+        assert!(!expected.contains('\n'));
+        assert_eq!(
+            structured_coaching_copy(
+                decision,
+                &expected,
+                feedback.alternative_action.as_deref(),
+                false,
+            ),
+            structured_coaching_copy(
+                decision,
+                &expected,
+                feedback.alternative_action.as_deref(),
+                true,
+            )
+        );
+        ui.feedback = Some(feedback);
+
+        let compact = rendered(&ui, 80, 30);
+        assert!(compact.contains("WHY"));
+        assert!(compact.contains('…'));
+        assert!(compact.contains("CONSIDER  ALTERNATIVE_SENTINEL"));
+        assert_eq!(compact.matches("Enter continue").count(), 1);
+
+        let assessment = ui.feedback.as_ref().unwrap().assessment.clone();
+        assert!(ui.pending.is_none());
+        toggle_coaching_details(&mut ui);
+        assert!(ui.deep);
+        assert!(ui.pending.is_none());
+        assert_eq!(ui.feedback.as_ref().unwrap().assessment, assessment);
+        let expanded = rendered(&ui, 100, 36);
+        assert!(expanded.contains("TOPIC"));
+        assert!(expanded.contains("First line explains the price"));
+        assert!(!expanded.contains("Full reasoning shown above"));
     }
 
     #[test]

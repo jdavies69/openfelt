@@ -272,9 +272,7 @@ fn render_coaching(frame: &mut Frame<'_>, state: &TableRenderState<'_>, area: Re
         fields[1],
     );
     frame.render_widget(
-        Paragraph::new(why)
-            .wrap(Wrap { trim: true })
-            .style(Style::default().fg(TEXT)),
+        Paragraph::new(wrapped_excerpt(why, fields[2].width, 2)).style(Style::default().fg(TEXT)),
         fields[2],
     );
     frame.render_widget(
@@ -292,6 +290,58 @@ fn render_coaching(frame: &mut Frame<'_>, state: &TableRenderState<'_>, area: Re
             ),
         rows[1],
     );
+}
+
+fn wrapped_excerpt(copy: &str, width: u16, max_lines: usize) -> String {
+    let width = usize::from(width).max(1);
+    let mut lines = vec![String::new()];
+    let mut truncated = false;
+    'words: for word in copy.split_whitespace() {
+        let current = lines.last_mut().expect("one line");
+        let separator = usize::from(!current.is_empty());
+        if Line::from(word).width() <= width
+            && Line::from(current.as_str()).width() + separator + Line::from(word).width() <= width
+        {
+            if separator == 1 {
+                current.push(' ');
+            }
+            current.push_str(word);
+        } else if Line::from(word).width() <= width {
+            if lines.len() == max_lines {
+                truncated = true;
+                break;
+            }
+            lines.push(word.to_string());
+        } else {
+            if !current.is_empty() {
+                if lines.len() == max_lines {
+                    truncated = true;
+                    break;
+                }
+                lines.push(String::new());
+            }
+            for character in word.chars() {
+                let current = lines.last_mut().expect("one line");
+                let cell_width = Line::from(character.to_string()).width();
+                if Line::from(current.as_str()).width() + cell_width > width {
+                    if lines.len() == max_lines {
+                        truncated = true;
+                        break 'words;
+                    }
+                    lines.push(String::new());
+                }
+                lines.last_mut().expect("one line").push(character);
+            }
+        }
+    }
+    if truncated {
+        let last = lines.last_mut().expect("one line");
+        while Line::from(last.as_str()).width() + Line::from("…").width() > width {
+            last.pop();
+        }
+        *last = format!("{}…", last.trim_end());
+    }
+    lines.join("\n")
 }
 
 /// Expanded coaching keeps the hero cards and controls visible below a wide,
@@ -1436,5 +1486,29 @@ mod tests {
         let text = rendered(&projection, Some(ReviewTone::Reconsider));
         assert!(text.contains("QUESTIONABLE DECISION"));
         assert!(text.contains("CONSIDER folding"));
+    }
+
+    #[test]
+    fn compact_why_uses_two_width_aware_lines_and_marks_overflow() {
+        let short = wrapped_excerpt("WHY one useful sentence", 40, 2);
+        assert_eq!(short, "WHY one useful sentence");
+
+        let long = wrapped_excerpt(
+            "WHY this explanation contains enough strategic context to exceed the available coaching width without consuming the alternative row",
+            32,
+            2,
+        );
+        assert_eq!(long.lines().count(), 2);
+        assert!(long.ends_with('…'));
+        assert!(long.lines().all(|line| Line::from(line).width() <= 32));
+
+        let unbroken = wrapped_excerpt(&format!("WHY {}", "x".repeat(100)), 12, 2);
+        assert_eq!(unbroken.lines().count(), 2);
+        assert!(unbroken.ends_with('…'));
+        assert!(unbroken.lines().all(|line| Line::from(line).width() <= 12));
+
+        let wide = wrapped_excerpt("WHY 手牌选择需要谨慎考虑位置和价格", 14, 2);
+        assert!(wide.ends_with('…'));
+        assert!(wide.lines().all(|line| Line::from(line).width() <= 14));
     }
 }
