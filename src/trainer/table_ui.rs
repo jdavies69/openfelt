@@ -4,7 +4,7 @@
 //! It owns geometry and styling, never game state or input handling.
 
 use crate::{
-    game::{deck::Card, seat::SeatId, table::HandParticipation},
+    game::{deck::Card, hand::evaluate_hand, seat::SeatId, table::HandParticipation},
     protocol::{ProjectedSeat, TableProjection},
 };
 use ratatui::{
@@ -14,6 +14,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
+use std::collections::BTreeMap;
 
 const BG: Color = Color::Rgb(30, 30, 30);
 const TABLE: Color = Color::Rgb(4, 4, 4);
@@ -213,7 +214,7 @@ fn render_coaching(frame: &mut Frame<'_>, state: &TableRenderState<'_>, area: Re
     let title = state.notice_title.unwrap_or("REVIEW");
     let (badge, color) = match state.review_tone.unwrap_or(ReviewTone::Uncertain) {
         ReviewTone::Good => ("✓ GOOD DECISION", GREEN),
-        ReviewTone::Reconsider => ("! REVIEW THIS", YELLOW),
+        ReviewTone::Reconsider => ("! QUESTIONABLE DECISION", YELLOW),
         ReviewTone::Uncertain => ("? UNCERTAIN", MUTED),
     };
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
@@ -452,6 +453,152 @@ fn render_stage(frame: &mut Frame<'_>, state: &TableRenderState<'_>, area: Rect)
             ),
         );
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HandResult {
+    headline: String,
+    detail: String,
+    winning_hand: Option<String>,
+    hero_won: bool,
+}
+
+fn hand_result(projection: &TableProjection, hero: SeatId) -> Option<HandResult> {
+    let mut totals = BTreeMap::<SeatId, u32>::new();
+    for payout in projection.awards.iter().flat_map(|award| &award.payouts) {
+        *totals.entry(payout.seat).or_default() += payout.amount;
+    }
+    if totals.is_empty() {
+        return None;
+    }
+
+    let hero_total = totals.get(&hero).copied().unwrap_or_default();
+    let hero_shared = projection
+        .awards
+        .iter()
+        .any(|award| award.winners.len() > 1 && award.winners.contains(&hero));
+    let any_shared = projection
+        .awards
+        .iter()
+        .any(|award| award.winners.len() > 1);
+    let headline = if hero_shared {
+        "SPLIT POT".to_string()
+    } else if hero_total > 0 {
+        "YOU WIN".to_string()
+    } else if any_shared {
+        "SPLIT POT".to_string()
+    } else if totals.len() == 1 {
+        let winner = *totals.keys().next().expect("non-empty payouts");
+        format!("{} WINS", seat_name(winner, hero).to_ascii_uppercase())
+    } else {
+        "POTS AWARDED".to_string()
+    };
+    let detail = totals
+        .iter()
+        .map(|(seat, amount)| {
+            if *seat == hero {
+                format!("You receive {amount} chips")
+            } else {
+                format!("Bot {} receives {amount} chips", seat.as_u8())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ·  ");
+
+    // A single winner's evaluated hand is unambiguous. For a genuinely shared
+    // pot, show the hand only when every winner's authorized cards are visible
+    // and evaluate to the same description. Never infer from hidden cards.
+    let shared_winners = projection.awards.first().and_then(|first| {
+        (first.winners.len() > 1
+            && projection
+                .awards
+                .iter()
+                .all(|award| award.winners == first.winners))
+        .then(|| first.winners.clone())
+    });
+    let winning_seats = if totals.len() == 1 {
+        totals.keys().copied().collect::<Vec<_>>()
+    } else {
+        shared_winners.unwrap_or_default()
+    };
+    let winning_hand = visible_shared_description(projection, &winning_seats);
+
+    Some(HandResult {
+        headline,
+        detail,
+        winning_hand,
+        hero_won: hero_total > 0,
+    })
+}
+
+fn visible_shared_description(projection: &TableProjection, winners: &[SeatId]) -> Option<String> {
+    if projection.board.len() != 5 || winners.is_empty() {
+        return None;
+    }
+    let descriptions = winners
+        .iter()
+        .map(|winner| {
+            let cards = projection
+                .seats
+                .iter()
+                .find(|seat| seat.seat == *winner)?
+                .hole_cards
+                .as_deref()?;
+            (cards.len() == 2).then(|| evaluate_hand(cards, &projection.board).description)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    descriptions
+        .iter()
+        .all(|description| description == &descriptions[0])
+        .then(|| descriptions[0].clone())
+}
+
+fn render_hand_result(frame: &mut Frame<'_>, state: &TableRenderState<'_>, available: Rect) {
+    let Some(result) = hand_result(state.projection, state.hero) else {
+        return;
+    };
+    let height = available
+        .height
+        .min(if result.winning_hand.is_some() { 6 } else { 5 });
+    let width = available.width.saturating_sub(8).min(64);
+    let area = Rect::new(
+        available.x + available.width.saturating_sub(width) / 2,
+        available.y,
+        width,
+        height,
+    );
+    let accent = if result.hero_won { GREEN } else { TEXT };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            result.headline,
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(result.detail, Style::default().fg(TEXT))),
+    ];
+    if let Some(description) = result.winning_hand {
+        lines.push(Line::from(Span::styled(
+            format!("Winning hand · {description}"),
+            Style::default().fg(MUTED),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "Enter · next hand   V · replay",
+        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+    )));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(PANEL))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(accent))
+                    .style(Style::default().bg(PANEL)),
+            ),
+        area,
+    );
 }
 
 fn render_board(frame: &mut Frame<'_>, projection: &TableProjection, table: Rect) {
@@ -946,6 +1093,10 @@ fn render_controls(frame: &mut Frame<'_>, state: &TableRenderState<'_>, area: Re
         render_raise(frame, raise, area);
         return;
     }
+    if state.mode == TableMode::Complete {
+        render_hand_result(frame, state, area);
+        return;
+    }
     let hero_turn = state.projection.to_act == Some(state.hero) && state.mode == TableMode::Playing;
     let banner = Rect::new(area.x, area.y, area.width, 1);
     let label = match state.mode {
@@ -969,15 +1120,6 @@ fn render_controls(frame: &mut Frame<'_>, state: &TableRenderState<'_>, area: Re
         .alignment(Alignment::Center),
         banner,
     );
-    if state.mode == TableMode::Complete {
-        frame.render_widget(
-            Paragraph::new("Enter next hand  ·  V replay  ·  B top up  ·  W withdraw")
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(TEXT).bg(PANEL)),
-            Rect::new(area.x + 5, area.y + 2, area.width.saturating_sub(10), 2),
-        );
-        return;
-    }
     let buttons = Layout::horizontal([
         Constraint::Percentage(28),
         Constraint::Length(1),
@@ -1118,5 +1260,181 @@ fn seat_name(seat: SeatId, hero: SeatId) -> String {
         "you".into()
     } else {
         format!("bot {}", seat.as_u8())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        game::{
+            deck::{Rank, Suit},
+            multiway::{MultiwayPhase, PotAward, SeatPayout},
+            seat::TableSize,
+        },
+        protocol::{HandId, ProjectionKind},
+    };
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn seat(index: u8) -> SeatId {
+        SeatId::new(index).unwrap()
+    }
+
+    fn card(rank: Rank, suit: Suit) -> Card {
+        Card::new(rank, suit)
+    }
+
+    fn projection(awards: Vec<PotAward>, bot_cards: Option<Vec<Card>>) -> TableProjection {
+        TableProjection {
+            showdown: None,
+            mucked: vec![],
+            shown: vec![],
+            always_show: false,
+            hand_id: HandId(7),
+            audience: ProjectionKind::Player { seat: seat(0) },
+            table_size: TableSize::new(2).unwrap(),
+            phase: MultiwayPhase::HandComplete,
+            button: seat(0),
+            small_blind: seat(0),
+            big_blind: seat(1),
+            small_blind_amount: 1,
+            big_blind_amount: 2,
+            ante_amount: 0,
+            to_act: None,
+            board: vec![
+                card(Rank::Ace, Suit::Spades),
+                card(Rank::King, Suit::Hearts),
+                card(Rank::Queen, Suit::Clubs),
+                card(Rank::Jack, Suit::Diamonds),
+                card(Rank::Two, Suit::Spades),
+            ],
+            current_wager: 0,
+            pot_total: awards.iter().map(|award| award.amount).sum(),
+            seats: vec![
+                ProjectedSeat {
+                    seat: seat(0),
+                    stack: 120,
+                    street_contribution: 0,
+                    hand_contribution: 20,
+                    participation: HandParticipation::Live,
+                    hole_cards: Some(vec![
+                        card(Rank::Ten, Suit::Spades),
+                        card(Rank::Nine, Suit::Spades),
+                    ]),
+                },
+                ProjectedSeat {
+                    seat: seat(1),
+                    stack: 80,
+                    street_contribution: 0,
+                    hand_contribution: 20,
+                    participation: HandParticipation::Live,
+                    hole_cards: bot_cards,
+                },
+            ],
+            pots: vec![],
+            awards,
+            legal_actions: None,
+        }
+    }
+
+    fn award(amount: u32, winners: &[u8], payouts: &[(u8, u32)]) -> PotAward {
+        PotAward {
+            pot_index: 0,
+            amount,
+            eligible: vec![seat(0), seat(1)],
+            winners: winners.iter().copied().map(seat).collect(),
+            payouts: payouts
+                .iter()
+                .map(|(winner, amount)| SeatPayout {
+                    seat: seat(*winner),
+                    amount: *amount,
+                })
+                .collect(),
+        }
+    }
+
+    fn rendered(projection: &TableProjection, tone: Option<ReviewTone>) -> String {
+        let state = TableRenderState {
+            projection,
+            hero: seat(0),
+            hand_id: 7,
+            recent_actions: &[],
+            status: "",
+            mode: if tone.is_some() {
+                TableMode::Paused
+            } else {
+                TableMode::Complete
+            },
+            notice_title: tone.map(|_| "REVIEW"),
+            notice: tone.map(|_| "BEFORE ACTION hero called\nWHY price was poor\nCONSIDER folding"),
+            raise: None,
+            hand_label: None,
+            review_tone: tone,
+            guidance_source: Some("heuristic guidance"),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn minimum_viewport_makes_hero_win_prominent() {
+        let projection = projection(vec![award(40, &[0], &[(0, 40)])], None);
+        let text = rendered(&projection, None);
+        assert!(text.contains("YOU WIN"));
+        assert!(text.contains("You receive 40 chips"));
+        assert!(text.contains("Winning hand"));
+        assert!(text.contains("Enter · next hand"));
+    }
+
+    #[test]
+    fn loss_does_not_leak_an_unshown_winning_hand() {
+        let projection = projection(vec![award(40, &[1], &[(1, 40)])], None);
+        let text = rendered(&projection, None);
+        assert!(text.contains("BOT 1 WINS"));
+        assert!(text.contains("Bot 1 receives 40 chips"));
+        assert!(!text.contains("Winning hand"));
+    }
+
+    #[test]
+    fn fold_win_omits_an_unavailable_winning_hand() {
+        let mut projection = projection(vec![award(12, &[0], &[(0, 12)])], None);
+        projection.board.truncate(3);
+        let text = rendered(&projection, None);
+        assert!(text.contains("YOU WIN"));
+        assert!(text.contains("You receive 12 chips"));
+        assert!(!text.contains("Winning hand"));
+    }
+
+    #[test]
+    fn shared_pot_is_distinct_from_separate_side_pot_winners() {
+        let split = projection(vec![award(41, &[0, 1], &[(0, 21), (1, 20)])], None);
+        assert!(rendered(&split, None).contains("SPLIT POT"));
+
+        let mut main = award(60, &[1], &[(1, 60)]);
+        main.pot_index = 0;
+        let mut side = award(20, &[0], &[(0, 20)]);
+        side.pot_index = 1;
+        let side_pots = projection(vec![main, side], None);
+        let text = rendered(&side_pots, None);
+        assert!(text.contains("YOU WIN"));
+        assert!(text.contains("You receive 20 chips"));
+        assert!(text.contains("Bot 1 receives 60 chips"));
+        assert!(!text.contains("SPLIT POT"));
+        assert!(!text.contains("Winning hand"));
+    }
+
+    #[test]
+    fn questionable_decision_badge_is_explicit_at_minimum_size() {
+        let projection = projection(vec![award(40, &[1], &[(1, 40)])], None);
+        let text = rendered(&projection, Some(ReviewTone::Reconsider));
+        assert!(text.contains("QUESTIONABLE DECISION"));
+        assert!(text.contains("CONSIDER folding"));
     }
 }

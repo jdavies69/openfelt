@@ -33,7 +33,7 @@ impl Provider {
     }
     pub const fn models(self) -> &'static [&'static str] {
         match self {
-            Self::Openai => &["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-5"],
+            Self::Openai => &["gpt-5.4-nano", "gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-5"],
             Self::Anthropic => &[
                 "claude-haiku-4-5-20251001",
                 "claude-sonnet-5",
@@ -58,7 +58,7 @@ pub struct ProviderSettings {
 impl Default for ProviderSettings {
     fn default() -> Self {
         Self {
-            model: String::new(),
+            model: Provider::Openai.models()[0].into(),
             timeout_seconds: 20,
             max_output_tokens: 600,
             max_requests: 30,
@@ -733,6 +733,8 @@ mod tests {
             "sk-edge-trim"
         );
         assert!(Credential::new("sk-bad\nmiddle".into()).is_err());
+        assert_eq!(Provider::Openai.models()[0], "gpt-5.4-nano");
+        assert_eq!(ProviderSettings::default().model, "gpt-5.4-nano");
         assert!(Provider::Openai.models().contains(&"gpt-5"));
         let auth = classify_provider_http_status(401, "Coaching unavailable");
         assert!(auth.contains("authentication rejected"));

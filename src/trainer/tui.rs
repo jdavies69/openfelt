@@ -62,6 +62,49 @@ impl Drop for TerminalGuard {
         let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
     }
 }
+#[derive(Default)]
+struct SessionCredentials {
+    openai: Option<Result<Option<provider::Credential>, String>>,
+    anthropic: Option<Result<Option<provider::Credential>, String>>,
+}
+impl SessionCredentials {
+    fn slot(
+        &mut self,
+        provider: Provider,
+    ) -> &mut Option<Result<Option<provider::Credential>, String>> {
+        match provider {
+            Provider::Openai => &mut self.openai,
+            Provider::Anthropic => &mut self.anthropic,
+        }
+    }
+    fn resolve(
+        &mut self,
+        provider: Provider,
+        store: &dyn provider::CredentialStore,
+    ) -> Result<Option<provider::Credential>, String> {
+        self.resolve_with(provider, || {
+            provider::resolve_credential(provider, None, store).map(|(key, _)| key)
+        })
+    }
+    fn resolve_with(
+        &mut self,
+        provider: Provider,
+        lookup: impl FnOnce() -> Result<Option<provider::Credential>, String>,
+    ) -> Result<Option<provider::Credential>, String> {
+        let slot = self.slot(provider);
+        if slot.is_none() {
+            *slot = Some(lookup());
+        }
+        slot.as_ref().expect("credential lookup cached").clone()
+    }
+    fn clear(&mut self) {
+        self.openai = None;
+        self.anthropic = None;
+    }
+    fn invalidate(&mut self, provider: Provider) {
+        *self.slot(provider) = None;
+    }
+}
 struct Ui {
     session: Session,
     input: Input,
@@ -84,6 +127,7 @@ struct Ui {
     saved_progress: Vec<u8>,
     settings: Option<SettingsEditor>,
     credential_test: Option<CredentialTest>,
+    credentials: SessionCredentials,
     update_task: Option<update::UpdateTask>,
     practice_note: Option<String>,
     restart_notice: Option<String>,
@@ -121,6 +165,7 @@ pub fn run(
         saved_progress: Vec::new(),
         settings: first_run.then(|| settings_editor(ui_settings_placeholder())),
         credential_test: None,
+        credentials: SessionCredentials::default(),
         update_task: None,
         practice_note: None,
         restart_notice: None,
@@ -257,7 +302,10 @@ pub fn run(
                 KeyCode::Up => editor.field = editor.field.saturating_sub(1),
                 KeyCode::Down => editor.field = (editor.field + 1).min(8),
                 _ if editor.field == 2
-                    && apply_api_key_field(&mut editor, &mut ui.status, key, &SystemKeyring) => {}
+                    && apply_api_key_field(&mut editor, &mut ui.status, key, &SystemKeyring) =>
+                {
+                    ui.credentials.clear();
+                }
                 KeyCode::Left | KeyCode::Right if editor.field == 0 => {
                     ui.credential_test = None;
                     let coaching = match editor.draft.coaching {
@@ -265,13 +313,8 @@ pub fn run(
                         CoachingMode::Openai => CoachingMode::Anthropic,
                         CoachingMode::Anthropic => CoachingMode::Local,
                     };
-                    let source = if let Some(kind) = selected_provider(coaching) {
-                        provider::resolve_credential(kind, None, &SystemKeyring)
-                            .map(|(_, source)| format!("{source:?}"))
-                            .unwrap_or_else(|_| "unavailable".into())
-                    } else {
-                        "local".into()
-                    };
+                    ui.credentials.clear();
+                    let source = credential_source_label(coaching, false);
                     editor.switch_provider(coaching, source);
                 }
                 KeyCode::Left | KeyCode::Right if editor.field == 1 => {
@@ -339,24 +382,14 @@ pub fn run(
                         let result = selected_provider(editor.draft.coaching)
                             .ok_or_else(|| "Choose OpenAI or Anthropic".to_string())
                             .and_then(|kind| {
-                                let (key, source) = if editor.key.is_empty() {
-                                    let (key, source) =
-                                        provider::resolve_credential(kind, None, &SystemKeyring)?;
-                                    editor.source = format!("{source:?}");
-                                    (
-                                        key.ok_or_else(|| {
-                                            "Enter or configure an API key".to_string()
-                                        })?,
-                                        source,
-                                    )
+                                let key = if editor.key.is_empty() {
+                                    let key = ui.credentials.resolve(kind, &SystemKeyring)?;
+                                    editor.source = "loaded for explicit test".into();
+                                    key.ok_or_else(|| "Enter or configure an API key".to_string())?
                                 } else {
                                     editor.source = "Entered".into();
-                                    (
-                                        provider::Credential::new(editor.key.clone())?,
-                                        provider::CredentialSource::Cli,
-                                    )
+                                    provider::Credential::new(editor.key.clone())?
                                 };
-                                let _ = source;
                                 provider::test_credential(
                                     kind,
                                     editor.draft.cloud.clone(),
@@ -415,6 +448,15 @@ pub fn run(
                     }
                 }
                 KeyCode::Enter if editor.field == 7 => {
+                    let credentials_changed = !editor.key.is_empty()
+                        || editor.draft.coaching != ui.session.settings.coaching;
+                    if credentials_changed {
+                        if let Some(kind) = selected_provider(editor.draft.coaching) {
+                            ui.credentials.invalidate(kind);
+                        } else {
+                            ui.credentials.clear();
+                        }
+                    }
                     match editor.draft.validate().and_then(|_| {
                         if !editor.key.is_empty() {
                             let kind = selected_provider(editor.draft.coaching)
@@ -765,8 +807,10 @@ impl Ui {
                 return;
             }
         };
-        let result = provider::resolve_credential(kind, None, &SystemKeyring)
-            .and_then(|(key, _)| {
+        let result = self
+            .credentials
+            .resolve(kind, &SystemKeyring)
+            .and_then(|key| {
                 key.ok_or_else(|| format!("{} or a saved key is required", kind.environment()))
             })
             .and_then(|key| {
@@ -900,13 +944,7 @@ fn ui_settings_placeholder() -> Settings {
     Settings::default()
 }
 fn settings_editor(draft: Settings) -> SettingsEditor {
-    let source = selected_provider(draft.coaching)
-        .and_then(|kind| {
-            provider::resolve_credential(kind, None, &SystemKeyring)
-                .ok()
-                .map(|(_, source)| format!("{source:?}"))
-        })
-        .unwrap_or_else(|| "local".into());
+    let source = credential_source_label(draft.coaching, false);
     SettingsEditor {
         draft,
         field: 0,
@@ -923,17 +961,16 @@ fn settings_editor(draft: Settings) -> SettingsEditor {
 }
 
 fn refresh_credential_source_label(editor: &mut SettingsEditor) {
-    if !editor.key.is_empty() {
-        editor.source = "Entered".into();
-        return;
+    editor.source = credential_source_label(editor.draft.coaching, !editor.key.is_empty());
+}
+fn credential_source_label(mode: CoachingMode, entered: bool) -> String {
+    if entered {
+        "entered; not saved".into()
+    } else if selected_provider(mode).is_some() {
+        "saved key not checked".into()
+    } else {
+        "local; no key needed".into()
     }
-    editor.source = selected_provider(editor.draft.coaching)
-        .and_then(|kind| {
-            provider::resolve_credential(kind, None, &SystemKeyring)
-                .ok()
-                .map(|(_, source)| format!("{source:?}"))
-        })
-        .unwrap_or_else(|| "local".into());
 }
 fn selected_provider(mode: CoachingMode) -> Option<Provider> {
     match mode {
@@ -1404,6 +1441,7 @@ fn excerpt(copy: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     fn ui(seats: u8) -> Ui {
         Ui {
             session: Session::new(Settings {
@@ -1431,6 +1469,7 @@ mod tests {
             saved_progress: vec![],
             settings: None,
             credential_test: None,
+            credentials: SessionCredentials::default(),
             update_task: None,
             practice_note: None,
             restart_notice: None,
@@ -1462,6 +1501,79 @@ mod tests {
         let text = rendered(&ui(6), 60, 20);
         assert!(text.contains("needs 80"));
         assert!(text.contains("Q quits safely"));
+    }
+    #[test]
+    fn settings_labels_and_provider_navigation_never_read_credentials() {
+        let mut editor = settings_editor(Settings::default());
+        assert_eq!(editor.source, "local; no key needed");
+        for mode in [
+            CoachingMode::Openai,
+            CoachingMode::Anthropic,
+            CoachingMode::Local,
+        ] {
+            editor.switch_provider(mode, credential_source_label(mode, false));
+        }
+        assert_eq!(editor.source, "local; no key needed");
+        assert_eq!(
+            credential_source_label(CoachingMode::Openai, false),
+            "saved key not checked"
+        );
+        let mut cloud_ui = ui(2);
+        cloud_ui.session.settings.coaching = CoachingMode::Openai;
+        cloud_ui.consent = true;
+        assert!(cloud_ui.credentials.openai.is_none());
+        assert!(cloud_ui.credentials.anthropic.is_none());
+    }
+
+    #[test]
+    fn explicit_credential_lookup_caches_success_missing_and_denial_by_provider() {
+        let gets = AtomicUsize::new(0);
+        let mut cache = SessionCredentials::default();
+        for _ in 0..2 {
+            assert!(cache
+                .resolve_with(Provider::Openai, || {
+                    gets.fetch_add(1, Ordering::SeqCst);
+                    Ok(Some(provider::Credential::new("old-key".into()).unwrap()))
+                })
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(gets.load(Ordering::SeqCst), 1);
+
+        assert!(cache
+            .resolve_with(Provider::Anthropic, || {
+                gets.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            })
+            .unwrap()
+            .is_none());
+        assert_eq!(gets.load(Ordering::SeqCst), 2);
+        assert!(cache
+            .resolve_with(Provider::Anthropic, || panic!(
+                "missing result should be cached"
+            ))
+            .unwrap()
+            .is_none());
+
+        cache.invalidate(Provider::Openai);
+        assert_eq!(
+            cache
+                .resolve_with(Provider::Openai, || {
+                    gets.fetch_add(1, Ordering::SeqCst);
+                    Err("denied".into())
+                })
+                .err()
+                .as_deref(),
+            Some("denied")
+        );
+        assert_eq!(
+            cache
+                .resolve_with(Provider::Openai, || panic!("denial should be cached"))
+                .err()
+                .as_deref(),
+            Some("denied")
+        );
+        assert_eq!(gets.load(Ordering::SeqCst), 3);
     }
     #[test]
     fn settings_render_masks_credentials_and_exposes_keyboard_setup() {
