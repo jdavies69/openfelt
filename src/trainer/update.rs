@@ -23,9 +23,12 @@ pub fn current_version() -> &'static str {
 }
 
 pub fn target_triple() -> &'static str {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
+    target_triple_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn target_triple_for(os: &str, arch: &str) -> &'static str {
+    match (os, arch) {
         ("macos", "aarch64") => "aarch64-apple-darwin",
-        ("macos", "x86_64") => "x86_64-apple-darwin",
         ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
         ("windows", "x86_64") => "x86_64-pc-windows-msvc",
         _ => "unsupported",
@@ -489,7 +492,7 @@ fn github_client() -> Result<reqwest::Client, String> {
 
 async fn get_limited(client: &reqwest::Client, url: &str, limit: usize) -> Result<Vec<u8>, String> {
     https_github(url)?;
-    let response = client
+    let mut response = client
         .get(url)
         .header(
             "accept",
@@ -508,14 +511,24 @@ async fn get_limited(client: &reqwest::Client, url: &str, limit: usize) -> Resul
     if response.content_length().is_some_and(|n| n > limit as u64) {
         return Err("Update download is larger than expected".into());
     }
-    let bytes = response
-        .bytes()
+    let mut bytes =
+        Vec::with_capacity(response.content_length().unwrap_or(0).min(limit as u64) as usize);
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|_| "Update download was interrupted".to_string())?;
-    if bytes.len() > limit {
+        .map_err(|_| "Update download was interrupted".to_string())?
+    {
+        append_limited(&mut bytes, &chunk, limit)?;
+    }
+    Ok(bytes)
+}
+
+fn append_limited(bytes: &mut Vec<u8>, chunk: &[u8], limit: usize) -> Result<(), String> {
+    if bytes.len().saturating_add(chunk.len()) > limit {
         return Err("Update download is larger than expected".into());
     }
-    Ok(bytes.to_vec())
+    bytes.extend_from_slice(chunk);
+    Ok(())
 }
 
 fn http_error(status: u16) -> String {
@@ -634,6 +647,31 @@ struct ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supported_targets_match_published_release_artifacts() {
+        assert_eq!(
+            target_triple_for("macos", "aarch64"),
+            "aarch64-apple-darwin"
+        );
+        assert_eq!(target_triple_for("macos", "x86_64"), "unsupported");
+        assert_eq!(
+            target_triple_for("linux", "x86_64"),
+            "x86_64-unknown-linux-gnu"
+        );
+        assert_eq!(
+            target_triple_for("windows", "x86_64"),
+            "x86_64-pc-windows-msvc"
+        );
+    }
+
+    #[test]
+    fn download_limit_is_enforced_while_chunks_arrive() {
+        let mut bytes = Vec::new();
+        append_limited(&mut bytes, b"1234", 5).unwrap();
+        assert!(append_limited(&mut bytes, b"56", 5).is_err());
+        assert_eq!(bytes, b"1234");
+    }
 
     fn release(tag: &str, prerelease: bool, assets: &[(&str, &str)]) -> String {
         let assets = assets

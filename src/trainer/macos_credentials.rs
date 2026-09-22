@@ -201,6 +201,7 @@ mod tests {
 
     /// Live round-trip: DP when allowed, otherwise login-keychain generic fallback.
     #[test]
+    #[ignore = "requires an explicit live macOS Keychain test"]
     fn optional_save_round_trip_prefers_dp_falls_back_to_generic() {
         let account = format!("openfelt-test-{}", std::process::id());
         // Use a dedicated provider-shaped path via generic/internet helpers with a
