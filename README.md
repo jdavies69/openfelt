@@ -33,6 +33,7 @@ openfelt
 | A | Review an all-in; Enter confirms, Esc cancels |
 | Enter | Submit an amount, continue after teaching, or deal the next hand |
 | ? | Expand teaching details, or show help outside the coaching pause |
+| R | Browse completed hands, step decisions, and bookmark review spots |
 | B | Between hands: rebuy/top up to 100BB |
 | W | Between hands: withdraw chips with confirmation |
 | Q | Quit at any time |

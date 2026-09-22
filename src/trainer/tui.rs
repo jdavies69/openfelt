@@ -54,6 +54,7 @@ struct Ui {
     accounted_profit: i64,
     cash_saved: usize,
     replay_saved: usize,
+    replay: Option<super::replay_ui::ReplayUi>,
     saved_progress: Vec<u8>,
 }
 pub fn run(settings: Settings, store: Store) -> Result<(), Box<dyn std::error::Error>> {
@@ -76,6 +77,7 @@ pub fn run(settings: Settings, store: Store) -> Result<(), Box<dyn std::error::E
         accounted_profit: 0,
         cash_saved: 0,
         replay_saved: 0,
+        replay: None,
         saved_progress: Vec::new(),
     };
     enable_raw_mode()?;
@@ -164,6 +166,24 @@ pub fn run(settings: Settings, store: Store) -> Result<(), Box<dyn std::error::E
             KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
             other => other,
         };
+        if let Some(mut replay) = ui.replay.take() {
+            match replay.key(key.code, &store) {
+                Ok(true) => ui.status = "Returned to table".into(),
+                Ok(false) => ui.replay = Some(replay),
+                Err(e) => {
+                    ui.status = e;
+                    ui.replay = Some(replay);
+                }
+            }
+            continue;
+        }
+        if code == KeyCode::Char('r') && ui.session.coaching.is_none() {
+            match super::replay_ui::ReplayUi::open(&store) {
+                Ok(replay) => ui.replay = Some(replay),
+                Err(e) => ui.status = e,
+            }
+            continue;
+        }
         if ui.consent {
             match code {
                 KeyCode::Enter => {
@@ -410,6 +430,10 @@ fn cards(cards: &[crate::game::deck::Card]) -> String {
         .join("  ")
 }
 fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
+    if let Some(replay) = &ui.replay {
+        replay.draw(frame);
+        return;
+    }
     let area = frame.area();
     let base = Style::default()
         .fg(Color::Rgb(224, 232, 224))
@@ -656,6 +680,7 @@ mod tests {
             accounted_profit: 0,
             cash_saved: 0,
             replay_saved: 0,
+            replay: None,
             saved_progress: vec![],
         }
     }

@@ -6,6 +6,7 @@ pub mod facts;
 pub mod policy;
 pub mod provider;
 pub mod replay;
+pub mod replay_ui;
 pub mod storage;
 pub mod tui;
 
