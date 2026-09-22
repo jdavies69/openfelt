@@ -1,7 +1,12 @@
 //! OpenFelt's local controller. Engine, policy and coaching have separate contracts.
+pub mod coaching;
+pub mod drills;
+pub mod evaluation;
 pub mod facts;
 pub mod policy;
 pub mod provider;
+pub mod replay;
+pub mod replay_ui;
 pub mod storage;
 pub mod tui;
 
@@ -14,6 +19,7 @@ use crate::game::{
 use crate::protocol::{project_hand, HandId, ProjectionAudience, TableProjection};
 use facts::{Decision, Facts, Observation};
 use policy::Opponent;
+use replay::{CompletedHand, ReplayDecision};
 use serde::{Deserialize, Serialize};
 use storage::Settings;
 
@@ -39,6 +45,9 @@ pub struct Session {
     pub session_profit: i64,
     settled: bool,
     pub completed_hands: u64,
+    pub session_id: String,
+    replay_decisions: Vec<ReplayDecision>,
+    pub replay_ready: Vec<CompletedHand>,
 }
 impl Session {
     pub fn new(settings: Settings) -> Result<Self, String> {
@@ -59,6 +68,7 @@ impl Session {
             .seats()
             .map(|_| Opponent::new(rand::random(), settings.opponents.clone()))
             .collect();
+        let session_id = format!("{:032x}", rand::random::<u128>());
         Ok(Self {
             hand,
             hand_id: 1,
@@ -71,7 +81,20 @@ impl Session {
             session_profit: 0,
             settled: false,
             completed_hands: 0,
+            session_id,
+            replay_decisions: Vec::new(),
+            replay_ready: Vec::new(),
         })
+    }
+    /// Deterministic construction for evaluation scenarios only.
+    pub fn new_seeded_for_evaluation(settings: Settings, seed: u64) -> Result<Self, String> {
+        let mut session = Self::new(settings)?;
+        let table = session.hand.table_size;
+        let chips = session.settings.big_blind * 100;
+        let stacks: Vec<_> = table.seats().map(|seat| (seat, chips)).collect();
+        session.hand = MultiwayHand::new_seeded_for_review(table, hero(), &stacks, seed)
+            .map_err(|e| e.to_string())?;
+        Ok(session)
     }
     pub fn view(&self) -> TableProjection {
         self.frozen_view.clone().unwrap_or_else(|| {
@@ -116,6 +139,11 @@ impl Session {
             accepted_action: action,
             facts,
         });
+        let decision = self.coaching.as_ref().expect("accepted decision").clone();
+        self.replay_decisions.push(ReplayDecision {
+            decision: decision.clone(),
+            feedback: facts::local_feedback(&decision),
+        });
         self.frozen_view = Some(old_view);
         Ok(self.coaching.as_ref().expect("accepted decision"))
     }
@@ -154,6 +182,19 @@ impl Session {
             self.session_profit +=
                 i64::from(self.hand.seat(hero()).stack) - i64::from(self.opening_hero_stack);
             self.completed_hands += 1;
+            self.replay_ready.push(CompletedHand {
+                version: replay::REPLAY_VERSION,
+                session_id: self.session_id.clone(),
+                hand_id: format!("{}-{}", self.session_id, self.hand_id),
+                sequence: self.hand_id,
+                decisions: std::mem::take(&mut self.replay_decisions),
+                outcome: project_hand(
+                    &self.hand,
+                    HandId(self.hand_id),
+                    ProjectionAudience::Player(hero()),
+                )
+                .expect("hero occupies completed table"),
+            });
             self.settled = true;
         }
     }
@@ -237,6 +278,7 @@ impl Session {
         )
         .map_err(|e| e.to_string())?;
         self.hand_id += 1;
+        self.replay_decisions.clear();
         self.settled = false;
         Ok(())
     }

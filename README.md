@@ -6,7 +6,9 @@ A public, MIT-licensed, local play-money No-Limit Texas Hold’em trainer. Start
 
 ## Run locally
 
-Install a current stable Rust toolchain, then:
+Download a versioned archive from [GitHub Releases](https://github.com/jdavies69/openfelt/releases), verify the accompanying checksum, extract it, and run `openfelt`. See [installation and upgrade instructions](docs/openfelt/INSTALL.md) for each supported platform.
+
+To build from source, install a current stable Rust toolchain, then:
 
 ```sh
 git clone https://github.com/jdavies69/openfelt.git
@@ -14,7 +16,7 @@ cd openfelt
 cargo run --locked --release --bin openfelt
 ```
 
-This is the first OpenFelt development build; the original audited baseline is preserved in Git history. Use a terminal at least **80 columns × 30 rows**; 100×36 gives more room. Tested locally on macOS arm64. Other platforms have a CI matrix; check the actual workflow results before relying on them. No prebuilt release is claimed.
+Use a terminal at least **80 columns × 30 rows**; 100×36 gives more room. Tagged releases are built by GitHub Actions for Linux x86_64, Windows x86_64, macOS Apple Silicon, and macOS Intel. Treat a platform as verified only when its release and Quality workflows are green; native clean-install walkthroughs remain a manual release check.
 
 To install the command from this checkout:
 
@@ -33,6 +35,8 @@ openfelt
 | A | Review an all-in; Enter confirms, Esc cancels |
 | Enter | Submit an amount, continue after teaching, or deal the next hand |
 | ? | Expand teaching details, or show help outside the coaching pause |
+| V | Between hands: browse saved hands and bookmark replay decisions |
+| S | Open settings when the table is not paused for coaching |
 | B | Between hands: rebuy/top up to 100BB |
 | W | Between hands: withdraw chips with confirmation |
 | Q | Quit at any time |
@@ -44,26 +48,36 @@ Blinds stay fixed and rake is off. Busted bots rebuy to preserve the selected se
 ```sh
 openfelt --seats 6 --small-blind 1 --big-blind 2 --opponents fundamentals
 openfelt --opponents recreational --aggression 0.6 --bluff-rate 0.08 --mistake-rate 0.15
+openfelt --opponent-style loose --opponent-difficulty practiced
 openfelt --coaching off
+openfelt --drill starting-hands
+openfelt --drill position
+openfelt --drill calling-prices
+openfelt --drill value-betting
 openfelt --save-settings
 openfelt --stats
 ```
 
-`fundamentals`, `recreational`, and `competent` are **heuristic profiles**, not independently rated skill levels or GTO opponents. Starting ranges include pairs, broadway and suited aces; recreational adds suited connectors. Profiles vary call-price thresholds; style probabilities are independent settings. Opponents receive only their own cards and public data with separate random generators.
+The four drill topics each draw three questions from a larger local set, explain every answer, accept listed defensible alternatives, and persist attempts and accepted answers separately from ordinary hand/concept exposure. A recommendation appears only after at least two completed sets supply evidence; these exercises teach reviewed categorical rules rather than universal strategy.
 
-## Optional OpenAI coaching (BYOK)
+`fundamentals`, `recreational`, and `competent` remain **heuristic profiles**, not independently rated skill levels or GTO opponents. `--opponent-style tight|balanced|loose` changes range width and bluff/call tendencies, while `--opponent-difficulty beginner|practiced` changes decision consistency independently. Ranges account for position and prior raises; postflop policy recognizes made hands and basic flush/open-ended draws and varies sizing. Opponents receive only their own cards and public data with separate random generators. Behavioral fixtures verify reproducibility and legal completion, but no claim of human-equivalent skill is made.
 
-Local teaching is the default. The OpenAI Responses adapter is implemented and tested against local HTTP fixtures for authentication, request shape, structured output, errors, redirects, stale responses and timeouts. **Live model coaching quality has not been evaluated and no paid provider test has been run.** Choose a model that supports Responses structured outputs; unsupported models fail visibly and leave play available.
+## Optional OpenAI or Anthropic coaching (BYOK)
 
-Set `OPENAI_API_KEY` privately in your environment, then:
+Local teaching is the default. Press `S` to choose Local, OpenAI, or Anthropic, select a curated model, set a session request limit, and optionally save a key in the operating-system credential store. The first launch without CLI setup options opens this screen. Settings also cover seat count and opponent profile; table changes apply to the next session.
+
+The OpenAI Responses and Anthropic Messages adapters use the same allowlisted decision data and local response checks. Their request shapes are covered by local fixtures. **Live model coaching quality and paid credentials have not been evaluated.** Unsupported or retired models fail visibly and leave local play available. Curated model IDs are reviewed for releases; custom IDs remain available through `--model`.
+
+You may instead set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` privately in your environment:
 
 ```sh
 openfelt --coaching openai --model YOUR_MODEL_ID --max-requests 30 --max-output-tokens 600
+openfelt --coaching anthropic --model YOUR_MODEL_ID --max-requests 30 --max-output-tokens 600
 ```
 
-The app displays `https://api.openai.com/v1/responses` and asks you to enable cloud coaching for the current session. It sends only the allowlisted pre-decision player view, accepted action and calculated facts. The key goes only in the authentication header, never in the prompt, files or logs. No validation request is sent merely because a key is present. Enter at the coaching pause cancels the request and continues; T explicitly retries and may incur another charge. Q cancels and quits. There are no automatic retries, provider fallbacks, telemetry or project proxy.
+The app displays the selected provider and asks you to enable cloud coaching for the current session. It sends only the allowlisted pre-decision player view, accepted action and calculated facts. The key goes only in the authentication header, never in the prompt, settings, history, or logs. No validation request is sent merely because a key is present or saved. Enter at the coaching pause cancels the request and continues; T explicitly retries and may incur another charge. Q cancels and quits. There are no automatic retries, provider fallbacks, telemetry or project proxy.
 
-The first adapter accepts environment credentials only. Custom endpoints, native Anthropic, OpenAI-compatible services, local-model adapters, masked key entry and OS keychain integration are not implemented. OpenAI credentials cannot be redirected or automatically reused with another endpoint.
+Credential precedence is the selected provider's environment variable, its keychain entry, then no cloud credential. Nonsecret CLI options override saved settings. OpenAI and Anthropic use separate keychain accounts under service `dev.openfelt.coaching`; forgetting one never exposes or reuses it for the other provider. API keys are deliberately not accepted as command-line arguments because process listings and shell history can expose them. Custom endpoints, OpenAI-compatible services, and local-model adapters are outside this feature.
 
 Limits are per session. Optional estimated budget safeguards require explicit current prices and their date/source:
 
@@ -80,7 +94,11 @@ Cloud responses are schema-checked and strategic feedback is labeled heuristic. 
 
 ## Private local data
 
-OpenFelt uses the platform local-data folder plus `openfelt` (on macOS, normally `~/Library/Application Support/openfelt`). Nonsecret settings are saved only with `--save-settings`; decisions, concept counts, completed-hand stats, cash events and provider usage save locally. `--data-dir PATH` selects an isolated folder. Unix files are created with owner-only permissions. Keep private histories out of public bug reports. There is no automatic upload of history. Only new explicitly enabled cloud decisions are sent to the selected provider, whose privacy/billing terms apply.
+OpenFelt uses the platform local-data folder plus `openfelt` (on macOS, normally `~/Library/Application Support/openfelt`). The in-app Save action or `--save-settings` writes nonsecret settings; decisions, concept counts, completed-hand stats, cash events and provider usage save locally. API keys are excluded from this file and stored by macOS Keychain, Linux Secret Service/keyring, or Windows Credential Manager. `--data-dir PATH` selects an isolated folder for nonsecret state only. Unix files are created with owner-only permissions. Keep private histories out of public bug reports. There is no automatic upload of history.
+
+Completed hands can be browsed after a restart with `openfelt-replay list`, then `openfelt-replay show HAND_ID --decision 0`. Move forward or backward by changing the zero-based decision number. `openfelt-replay outcome HAND_ID` shows the separately stored final state. `openfelt-replay bookmark HAND_ID DECISION` saves a direct review target; `openfelt-replay bookmarks` lists them. Invalid history lines are skipped and reported without hiding valid hands. Replay decision views contain only the saved pre-decision information.
+
+Run `openfelt-eval` for the committed, reproducible offline coaching corpus and rubric report. It makes no provider calls. `--live` requires an API key plus explicit model, request count, and budget, but live adapter execution remains disabled until reviewed scenario decisions and dated price inputs are supplied. Offline fixture success does not establish live teaching quality.
 
 ## Development and provenance
 
@@ -95,7 +113,7 @@ On macOS/Linux, also run `python3 scripts/test_openfelt_pty.py target/release/op
 
 No model key is needed for tests. Provider tests run artificial localhost servers; some environments need localhost permission. New trainer code lives under `src/trainer/`; the engine and original binary targets remain available. Package registry publication is disabled until OpenFelt distribution metadata is deliberately prepared. Do not reuse inherited release tags/workflows without reviewing their upstream-specific distribution settings.
 
-The provider contract follows the [official OpenAI structured-output documentation](https://developers.openai.com/api/docs/guides/structured-outputs), checked September 21, 2026. Responses use `text.format` with a strict JSON schema, and the app validates the result again locally.
+The provider contracts follow the official [OpenAI structured-output documentation](https://developers.openai.com/api/docs/guides/structured-outputs) and [Anthropic Messages/model documentation](https://platform.claude.com/docs/en/models/overview), checked September 22, 2026. Both adapters request schema-constrained JSON and validate it again locally.
 
 Derived from [ashxudev/terminal-poker](https://github.com/ashxudev/terminal-poker) at `2e6cfe7454476ecd292797bb1801e4a6b2f70fb2`, preserving Git history and the original MIT license/copyright. No endorsement is implied. [Original README](docs/openfelt/UPSTREAM_README.md) is retained as historical upstream documentation; its installation and LAN instructions are not OpenFelt setup instructions.
 

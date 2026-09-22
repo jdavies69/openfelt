@@ -11,6 +11,9 @@ homepage = "https://github.com/jdavies69/openfelt"
 publish = false
 default-run = "poker"
 
+[package.metadata.dist]
+dist = true
+
 # Both binaries use the same source - users can run `terminal-poker` or `poker`
 [[bin]]
 name = "terminal-poker"
@@ -61,6 +64,14 @@ name = "poker-train"
 path = "src/bin/poker_train.rs"
 
 [[bin]]
+name = "openfelt-replay"
+path = "src/bin/openfelt_replay.rs"
+
+[[bin]]
+name = "openfelt-eval"
+path = "src/bin/openfelt_eval.rs"
+
+[[bin]]
 name = "poker-benchmark"
 path = "src/bin/poker_benchmark.rs"
 
@@ -98,13 +109,21 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 dirs = "5.0"
+keyring = { version = "3.6.3", default-features = false }
 sha2 = "0.10"
 ctrlc = "3.4"
 rustls = { version = "=0.23.44", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 
 [target.'cfg(windows)'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["linux-native-async-persistent", "tokio", "crypto-rust"] }
 
 [profile.release]
 lto = true

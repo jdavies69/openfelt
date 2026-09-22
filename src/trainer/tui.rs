@@ -1,7 +1,7 @@
 use super::{
     facts::{local_feedback, Feedback},
     hero,
-    provider::{self, Credential, Pending, Usage},
+    provider::{self, CredentialTest, Pending, Provider, SystemKeyring, Usage},
     storage::{CoachingMode, Progress, Settings, Store},
     Session,
 };
@@ -30,6 +30,29 @@ enum Input {
     AllIn,
     Withdraw(String),
 }
+struct SettingsEditor {
+    draft: Settings,
+    field: usize,
+    key: String,
+    reveal: bool,
+    source: String,
+    confirm_test: bool,
+    custom_model: bool,
+    confirm_forget: bool,
+}
+impl SettingsEditor {
+    fn switch_provider(&mut self, coaching: CoachingMode, source: String) {
+        self.draft.coaching = coaching;
+        self.source = source;
+        self.key.clear();
+        self.reveal = false;
+        self.confirm_test = false;
+        self.confirm_forget = false;
+        if let Some(kind) = selected_provider(coaching) {
+            self.draft.cloud.model = kind.models()[0].into();
+        }
+    }
+}
 struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
@@ -53,11 +76,23 @@ struct Ui {
     accounted_hands: u64,
     accounted_profit: i64,
     cash_saved: usize,
+    replay_saved: usize,
+    replay: Option<super::replay_ui::ReplayUi>,
     saved_progress: Vec<u8>,
+    settings: Option<SettingsEditor>,
+    credential_test: Option<CredentialTest>,
+    first_run: bool,
 }
-pub fn run(settings: Settings, store: Store) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(
+    settings: Settings,
+    store: Store,
+    first_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let progress = store.progress()?;
-    let consent = settings.coaching == CoachingMode::Openai;
+    let consent = matches!(
+        settings.coaching,
+        CoachingMode::Openai | CoachingMode::Anthropic
+    );
     let mut ui = Ui {
         session: Session::new(settings)?,
         input: Input::Play,
@@ -74,8 +109,16 @@ pub fn run(settings: Settings, store: Store) -> Result<(), Box<dyn std::error::E
         accounted_hands: 0,
         accounted_profit: 0,
         cash_saved: 0,
+        replay_saved: 0,
+        replay: None,
         saved_progress: Vec::new(),
+        settings: first_run.then(|| settings_editor(ui_settings_placeholder())),
+        credential_test: None,
+        first_run,
     };
+    if let Some(editor) = &mut ui.settings {
+        editor.draft = ui.session.settings.clone();
+    }
     enable_raw_mode()?;
     let _guard = TerminalGuard;
     execute!(io::stdout(), EnterAlternateScreen)?;
@@ -84,6 +127,14 @@ pub fn run(settings: Settings, store: Store) -> Result<(), Box<dyn std::error::E
     let mut redraw = true;
     let mut last_size = None;
     loop {
+        if let Some(result) = ui.credential_test.as_ref().and_then(CredentialTest::poll) {
+            ui.credential_test = None;
+            ui.status = match result {
+                Ok(()) => "Key test succeeded; settings are not saved yet".into(),
+                Err(e) => e,
+            };
+            redraw = true;
+        }
         if let Some(result) = ui.pending.as_ref().and_then(Pending::poll) {
             redraw = true;
             ui.pending = None;
@@ -120,6 +171,8 @@ pub fn run(settings: Settings, store: Store) -> Result<(), Box<dyn std::error::E
         }
         if !ui.consent
             && !ui.help
+            && ui.settings.is_none()
+            && ui.replay.is_none()
             && size.width >= 80
             && size.height >= 30
             && Instant::now() >= next_bot
@@ -149,10 +202,7 @@ pub fn run(settings: Settings, store: Store) -> Result<(), Box<dyn std::error::E
             continue;
         }
         redraw = true;
-        if key.code == KeyCode::Char('q')
-            || key.code == KeyCode::Char('Q')
-            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
-        {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             break;
         }
         if size.width < 80 || size.height < 30 {
@@ -162,12 +212,226 @@ pub fn run(settings: Settings, store: Store) -> Result<(), Box<dyn std::error::E
             KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
             other => other,
         };
+        if let Some(mut editor) = ui.settings.take() {
+            let mut close = false;
+            match key.code {
+                KeyCode::Esc => {
+                    ui.credential_test = None;
+                    close = true;
+                }
+                KeyCode::Up => editor.field = editor.field.saturating_sub(1),
+                KeyCode::Down => editor.field = (editor.field + 1).min(7),
+                KeyCode::Char('v' | 'V') if editor.field == 2 => editor.reveal = !editor.reveal,
+                KeyCode::Char('x' | 'X') if editor.field == 2 => {
+                    if !editor.confirm_forget {
+                        editor.confirm_forget = true;
+                        ui.status = "Press X again to forget this provider's saved key".into();
+                    } else if let Some(kind) = selected_provider(editor.draft.coaching) {
+                        match provider::CredentialStore::delete(&SystemKeyring, kind) {
+                            Ok(()) => {
+                                editor.key.clear();
+                                ui.status = "Saved key forgotten; local coaching selected".into();
+                                editor.draft.coaching = CoachingMode::Local;
+                            }
+                            Err(e) => ui.status = e,
+                        }
+                        editor.confirm_forget = false;
+                    }
+                }
+                KeyCode::Left | KeyCode::Right if editor.field == 0 => {
+                    ui.credential_test = None;
+                    let coaching = match editor.draft.coaching {
+                        CoachingMode::Local | CoachingMode::Off => CoachingMode::Openai,
+                        CoachingMode::Openai => CoachingMode::Anthropic,
+                        CoachingMode::Anthropic => CoachingMode::Local,
+                    };
+                    let source = if let Some(kind) = selected_provider(coaching) {
+                        provider::resolve_credential(kind, None, &SystemKeyring)
+                            .map(|(_, source)| format!("{source:?}"))
+                            .unwrap_or_else(|_| "unavailable".into())
+                    } else {
+                        "local".into()
+                    };
+                    editor.switch_provider(coaching, source);
+                }
+                KeyCode::Left | KeyCode::Right if editor.field == 1 => {
+                    if let Some(kind) = selected_provider(editor.draft.coaching) {
+                        let models = kind.models();
+                        let current = models
+                            .iter()
+                            .position(|m| *m == editor.draft.cloud.model)
+                            .unwrap_or(0);
+                        let next = if key.code == KeyCode::Left {
+                            (current + models.len() - 1) % models.len()
+                        } else {
+                            (current + 1) % models.len()
+                        };
+                        editor.draft.cloud.model = models[next].into();
+                        editor.custom_model = false;
+                    }
+                }
+                KeyCode::Char('e' | 'E') if editor.field == 1 && !editor.custom_model => {
+                    editor.draft.cloud.model.clear();
+                    editor.custom_model = true;
+                }
+                KeyCode::Backspace if editor.field == 1 && editor.custom_model => {
+                    editor.draft.cloud.model.pop();
+                }
+                KeyCode::Char(c)
+                    if editor.field == 1
+                        && editor.custom_model
+                        && editor.draft.cloud.model.len() < 128 =>
+                {
+                    if c.is_ascii_alphanumeric() || "-_.:/".contains(c) {
+                        editor.draft.cloud.model.push(c);
+                    }
+                }
+                KeyCode::Backspace if editor.field == 2 => {
+                    editor.key.pop();
+                }
+                KeyCode::Char(c)
+                    if editor.field == 2 && !c.is_control() && editor.key.len() < 256 =>
+                {
+                    editor.key.push(c)
+                }
+                KeyCode::Left if editor.field == 3 => {
+                    editor.draft.cloud.max_requests =
+                        editor.draft.cloud.max_requests.saturating_sub(1).max(1)
+                }
+                KeyCode::Right if editor.field == 3 => {
+                    editor.draft.cloud.max_requests =
+                        (editor.draft.cloud.max_requests + 1).min(1000)
+                }
+                KeyCode::Left if editor.field == 4 => {
+                    editor.draft.seats = editor.draft.seats.saturating_sub(1).max(2)
+                }
+                KeyCode::Right if editor.field == 4 => {
+                    editor.draft.seats = (editor.draft.seats + 1).min(9)
+                }
+                KeyCode::Left | KeyCode::Right if editor.field == 5 => {
+                    editor.draft.opponents.profile = match editor.draft.opponents.profile {
+                        super::policy::Profile::Fundamentals => {
+                            super::policy::Profile::Recreational
+                        }
+                        super::policy::Profile::Recreational => super::policy::Profile::Competent,
+                        super::policy::Profile::Competent => super::policy::Profile::Fundamentals,
+                    }
+                }
+                KeyCode::Enter if editor.field == 6 => {
+                    if !editor.confirm_test {
+                        editor.confirm_test = true;
+                        ui.status =
+                            "Press Enter again to make one potentially billable test request"
+                                .into();
+                    } else if ui.credential_test.is_none() {
+                        let result = selected_provider(editor.draft.coaching)
+                            .ok_or_else(|| "Choose OpenAI or Anthropic".to_string())
+                            .and_then(|kind| {
+                                let key = if editor.key.is_empty() {
+                                    provider::resolve_credential(kind, None, &SystemKeyring)?
+                                        .0
+                                        .ok_or_else(|| {
+                                            "Enter or configure an API key".to_string()
+                                        })?
+                                } else {
+                                    provider::Credential::new(editor.key.clone())?
+                                };
+                                provider::test_credential(
+                                    kind,
+                                    editor.draft.cloud.clone(),
+                                    key,
+                                    &mut ui.usage,
+                                )
+                            });
+                        match result {
+                            Ok(test) => {
+                                ui.credential_test = Some(test);
+                                ui.status = "Testing key…".into();
+                                if let Err(e) = store.append("usage.jsonl", &ui.usage) {
+                                    ui.status = e;
+                                }
+                            }
+                            Err(e) => ui.status = e,
+                        }
+                        editor.confirm_test = false;
+                    }
+                }
+                KeyCode::Enter if editor.field == 7 => {
+                    match editor.draft.validate().and_then(|_| {
+                        if !editor.key.is_empty() {
+                            let kind = selected_provider(editor.draft.coaching)
+                                .ok_or("Choose OpenAI or Anthropic before saving a key")?;
+                            let credential = provider::Credential::new(editor.key.clone())?;
+                            store.save("settings.json", &editor.draft)?;
+                            return provider::CredentialStore::set(
+                                &SystemKeyring,
+                                kind,
+                                credential,
+                            )
+                            .map_err(|_| {
+                                "Settings saved, but the API key could not be saved".into()
+                            });
+                        }
+                        store.save("settings.json", &editor.draft)
+                    }) {
+                        Ok(()) => {
+                            if ui.first_run {
+                                ui.session =
+                                    Session::new(editor.draft.clone()).expect("validated settings");
+                                ui.consent = matches!(
+                                    editor.draft.coaching,
+                                    CoachingMode::Openai | CoachingMode::Anthropic
+                                );
+                                ui.first_run = false;
+                                ui.status = "Setup saved; local table is ready".into();
+                            } else {
+                                ui.session.settings = editor.draft.clone();
+                                ui.status =
+                                    "Settings saved; table changes apply next session".into();
+                            }
+                            close = true;
+                        }
+                        Err(e) => ui.status = e,
+                    }
+                }
+                _ => {}
+            }
+            if !close {
+                ui.settings = Some(editor);
+            }
+            continue;
+        }
+        if matches!(key.code, KeyCode::Char('q' | 'Q')) {
+            break;
+        }
+        if let Some(mut replay) = ui.replay.take() {
+            match replay.key(key.code, &store) {
+                Ok(true) => ui.status = "Returned to table".into(),
+                Ok(false) => ui.replay = Some(replay),
+                Err(e) => {
+                    ui.status = e;
+                    ui.replay = Some(replay);
+                }
+            }
+            continue;
+        }
+        if code == KeyCode::Char('s') && ui.session.coaching.is_none() {
+            ui.settings = Some(settings_editor(ui.session.settings.clone()));
+            continue;
+        }
+        if code == KeyCode::Char('v') && replay_available(&ui) {
+            match super::replay_ui::ReplayUi::open(&store) {
+                Ok(replay) => ui.replay = Some(replay),
+                Err(e) => ui.status = e,
+            }
+            continue;
+        }
         if ui.consent {
             match code {
                 KeyCode::Enter => {
                     ui.consent = false;
                     ui.cloud_enabled = true;
-                    ui.status="OpenAI enabled for this session · optional calls may incur provider charges".into();
+                    ui.status="Cloud coaching enabled for this session · optional calls may incur provider charges".into();
                 }
                 KeyCode::Esc | KeyCode::Char('l') => {
                     ui.consent = false;
@@ -350,9 +614,27 @@ impl Ui {
         let Some(d) = self.session.coaching.clone() else {
             return;
         };
-        let result = Credential::from_environment().and_then(|key| {
-            provider::start(d, self.session.settings.cloud.clone(), key, &mut self.usage)
-        });
+        let kind = match self.session.settings.coaching {
+            CoachingMode::Openai => Provider::Openai,
+            CoachingMode::Anthropic => Provider::Anthropic,
+            _ => {
+                self.status = "Cloud coaching is not selected".into();
+                return;
+            }
+        };
+        let result = provider::resolve_credential(kind, None, &SystemKeyring)
+            .and_then(|(key, _)| {
+                key.ok_or_else(|| format!("{} or a saved key is required", kind.environment()))
+            })
+            .and_then(|key| {
+                provider::start(
+                    d,
+                    kind,
+                    self.session.settings.cloud.clone(),
+                    key,
+                    &mut self.usage,
+                )
+            });
         match result {
             Ok(p) => {
                 self.pending = Some(p);
@@ -388,7 +670,20 @@ impl Ui {
             }
             self.cash_saved += 1;
         }
+        while self.replay_saved < self.session.replay_ready.len() {
+            if let Err(e) = store.append(
+                "completed-hands.jsonl",
+                &self.session.replay_ready[self.replay_saved],
+            ) {
+                self.status = e;
+                break;
+            }
+            self.replay_saved += 1;
+        }
     }
+}
+fn replay_available(ui: &Ui) -> bool {
+    ui.session.finished() && ui.session.coaching.is_none() && matches!(ui.input, Input::Play)
 }
 fn cards(cards: &[crate::game::deck::Card]) -> String {
     cards
@@ -397,7 +692,40 @@ fn cards(cards: &[crate::game::deck::Card]) -> String {
         .collect::<Vec<_>>()
         .join("  ")
 }
+fn ui_settings_placeholder() -> Settings {
+    Settings::default()
+}
+fn settings_editor(draft: Settings) -> SettingsEditor {
+    let source = selected_provider(draft.coaching)
+        .and_then(|kind| {
+            provider::resolve_credential(kind, None, &SystemKeyring)
+                .ok()
+                .map(|(_, source)| format!("{source:?}"))
+        })
+        .unwrap_or_else(|| "local".into());
+    SettingsEditor {
+        draft,
+        field: 0,
+        key: String::new(),
+        reveal: false,
+        source,
+        confirm_test: false,
+        custom_model: false,
+        confirm_forget: false,
+    }
+}
+fn selected_provider(mode: CoachingMode) -> Option<Provider> {
+    match mode {
+        CoachingMode::Openai => Some(Provider::Openai),
+        CoachingMode::Anthropic => Some(Provider::Anthropic),
+        _ => None,
+    }
+}
 fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
+    if let Some(replay) = &ui.replay {
+        replay.draw(frame);
+        return;
+    }
     let area = frame.area();
     let base = Style::default()
         .fg(Color::Rgb(224, 232, 224))
@@ -405,6 +733,85 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
     frame.render_widget(Block::default().style(base), area);
     if area.width < 80 || area.height < 30 {
         frame.render_widget(Paragraph::new(format!("OpenFelt needs 80 × 30 or larger. Current: {} × {}.\nResize to continue. Q quits safely.",area.width,area.height)).style(base),area);
+        return;
+    }
+    if let Some(editor) = &ui.settings {
+        let key = if editor.key.is_empty() {
+            "(leave unchanged)".into()
+        } else {
+            provider::mask_credential(&editor.key, editor.reveal)
+        };
+        let rows = [
+            format!("Provider       {:?}", editor.draft.coaching),
+            format!(
+                "Model          {}  [←/→ curated · E custom]",
+                if editor.draft.cloud.model.is_empty() {
+                    "(none)"
+                } else {
+                    &editor.draft.cloud.model
+                }
+            ),
+            format!("API key        {key}   [V reveal · X forget]"),
+            format!(
+                "Session limit  {} requests",
+                editor.draft.cloud.max_requests
+            ),
+            format!(
+                "Table          {} seats · {}/{} blinds",
+                editor.draft.seats, editor.draft.small_blind, editor.draft.big_blind
+            ),
+            format!("Opponents      {:?}", editor.draft.opponents.profile),
+            if editor.confirm_test {
+                "Test key       CONFIRM billable request with Enter".into()
+            } else {
+                "Test key       explicit one-request check".into()
+            },
+            "Save and return".into(),
+            format!(
+                "Cloud limits   {} output tokens · budget {} · pricing {}",
+                editor.draft.cloud.max_output_tokens,
+                editor
+                    .draft
+                    .cloud
+                    .budget_usd
+                    .map(|v| format!("${v:.2}"))
+                    .unwrap_or_else(|| "unset".into()),
+                editor
+                    .draft
+                    .cloud
+                    .pricing_as_of
+                    .as_deref()
+                    .unwrap_or("unset; configure with CLI")
+            ),
+            format!("Status         {}", ui.status),
+        ];
+        let lines = rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                Line::from(format!(
+                    "{} {row}",
+                    if i == editor.field { "›" } else { " " }
+                ))
+            })
+            .collect::<Vec<_>>();
+        let panel = ratatui::layout::Rect {
+            x: area.x + 4,
+            y: area.y + 3,
+            width: area.width.saturating_sub(8),
+            height: 16.min(area.height.saturating_sub(6)),
+        };
+        frame.render_widget(ratatui::widgets::Clear, panel);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" SETTINGS · credential source: {} ", editor.source)),
+                )
+                .wrap(Wrap { trim: false }),
+            panel,
+        );
         return;
     }
     let regions = Layout::vertical([
@@ -427,11 +834,12 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
                 Span::raw("   Play the hand. Learn the game."),
             ]),
             Line::from(format!(
-                "Local play money · {}/{} blinds · {} seats · Rake OFF · {:?} opponents",
+                "Local play money · {}/{} blinds · {} seats · Rake OFF · {:?}/{:?} opponents",
                 ui.session.settings.small_blind,
                 ui.session.settings.big_blind,
                 ui.session.settings.seats,
-                ui.session.settings.opponents.profile
+                ui.session.settings.opponents.style,
+                ui.session.settings.opponents.difficulty
             )),
         ]),
         regions[0],
@@ -512,9 +920,10 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
         regions[1],
     );
     let (title, body) = if ui.consent {
-        (" ENABLE OPTIONAL CLOUD COACHING ",format!("Destination: https://api.openai.com/v1/responses\nModel: {} · credential: OPENAI_API_KEY\nOnly your pre-decision cards, public table/action data and teaching facts leave this device.\nProvider charges and data terms apply. Limit: {} requests / session.\nEnter enables paid coaching this session. Esc or L plays with local teaching.\nNo request is made until you accept a poker decision.",ui.session.settings.cloud.model,ui.session.settings.cloud.max_requests))
+        let kind = selected_provider(ui.session.settings.coaching).expect("cloud consent provider");
+        (" ENABLE OPTIONAL CLOUD COACHING ",format!("Destination: {}\nModel: {} · credential: {} or OS keychain\nOnly your pre-decision cards, public table/action data and teaching facts leave this device.\nProvider charges and data terms apply. Limit: {} requests / session.\nEnter enables paid coaching this session. Esc or L plays with local teaching.\nNo request is made until you accept a poker decision.",kind.endpoint(),ui.session.settings.cloud.model,kind.environment(),ui.session.settings.cloud.max_requests))
     } else if ui.help {
-        (" HOW TO PLAY ","F folds · C checks or calls · R opens bet/raise TO entry in chips.\nEnter submits an amount; arrows adjust by one chip. A asks for all-in confirmation.\nAfter every accepted decision the table pauses: Enter continues, ? expands teaching.\nBetween hands: B tops up/rebuys to 100BB; W withdraws chips; Enter deals.\nBots use heuristic starting ranges and style settings, not solver strategies.\nSettings and private learning history live in your local OpenFelt data folder.\nQ quits at any time. No timer acts for you.".into())
+        (" HOW TO PLAY ","F folds · C checks or calls · R opens bet/raise TO entry in chips.\nEnter submits an amount; arrows adjust by one chip. A asks for all-in confirmation.\nAfter every accepted decision the table pauses: Enter continues, ? expands teaching.\nBetween hands: V browses saved hands; B tops up/rebuys; W withdraws; Enter deals.\nIn replay: arrows browse; B bookmarks; O shows outcome; Esc returns.\nRun openfelt --drill <topic> for a short offline practice set.\nBots use reviewed heuristic ranges, style, and difficulty—not solver strategies.\nSettings and private learning history live in your local OpenFelt data folder.\nQ quits at any time. No timer acts for you.".into())
     } else if let Some(d) = &ui.session.coaching {
         let explanation = if ui.session.settings.coaching == CoachingMode::Off {
             "Coaching off. Your decision is accepted.".into()
@@ -642,7 +1051,12 @@ mod tests {
             accounted_hands: 0,
             accounted_profit: 0,
             cash_saved: 0,
+            replay_saved: 0,
+            replay: None,
             saved_progress: vec![],
+            settings: None,
+            credential_test: None,
+            first_run: false,
         }
     }
     fn rendered(ui: &Ui, width: u16, height: u16) -> String {
@@ -670,6 +1084,64 @@ mod tests {
         let text = rendered(&ui(6), 60, 20);
         assert!(text.contains("needs 80"));
         assert!(text.contains("Q quits safely"));
+    }
+    #[test]
+    fn settings_render_masks_credentials_and_exposes_keyboard_setup() {
+        let mut ui = ui(6);
+        ui.settings = Some(SettingsEditor {
+            draft: Settings::default(),
+            field: 2,
+            key: "sk-secretabcd".into(),
+            reveal: false,
+            source: "Keyring".into(),
+            confirm_test: false,
+            custom_model: false,
+            confirm_forget: false,
+        });
+        let screen = rendered(&ui, 100, 36);
+        assert!(screen.contains("SETTINGS"));
+        assert!(screen.contains("sk-••••••••abcd"));
+        assert!(!screen.contains("sk-secretabcd"));
+        assert!(screen.contains("explicit one-request check"));
+        assert!(screen.contains("credential source: Keyring"));
+    }
+    #[test]
+    fn provider_switch_discards_uncommitted_secret_and_confirmations() {
+        let mut editor = SettingsEditor {
+            draft: Settings {
+                coaching: CoachingMode::Openai,
+                ..Default::default()
+            },
+            field: 0,
+            key: "openai-secret".into(),
+            reveal: true,
+            source: "Environment".into(),
+            confirm_test: true,
+            custom_model: true,
+            confirm_forget: true,
+        };
+        editor.switch_provider(CoachingMode::Anthropic, "Missing".into());
+        assert!(editor.key.is_empty());
+        assert!(!editor.reveal && !editor.confirm_test && !editor.confirm_forget);
+        assert_eq!(editor.draft.cloud.model, Provider::Anthropic.models()[0]);
+    }
+    #[test]
+    fn replay_opens_only_between_hands() {
+        let mut ui = ui(2);
+        assert!(!replay_available(&ui));
+        for _ in 0..100 {
+            if ui.session.finished() {
+                break;
+            }
+            if ui.session.view().to_act == Some(hero()) {
+                ui.session.submit(Action::Fold).unwrap();
+                ui.session.continue_hand();
+            } else {
+                ui.session.step_bot().unwrap();
+            }
+        }
+        assert!(ui.session.finished());
+        assert!(replay_available(&ui));
     }
     #[test]
     fn coaching_and_deep_view_keep_continuation_visible() {

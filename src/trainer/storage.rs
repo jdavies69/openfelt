@@ -28,6 +28,7 @@ pub enum CoachingMode {
     Local,
     Off,
     Openai,
+    Anthropic,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -70,6 +71,15 @@ pub struct Progress {
     pub decisions: u64,
     pub profit_chips: i64,
     pub concepts: BTreeMap<String, u64>,
+    /// Drill outcomes are distinct from passive concept exposure during hands.
+    pub drills: BTreeMap<String, DrillProgress>,
+}
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DrillProgress {
+    pub attempts: u64,
+    pub correct: u64,
+    pub completed_sets: u64,
 }
 pub struct Store {
     pub root: PathBuf,
@@ -84,6 +94,9 @@ impl Store {
     }
     pub fn settings(&self) -> Result<Settings, String> {
         self.load("settings.json")
+    }
+    pub fn has_settings(&self) -> bool {
+        self.root.join("settings.json").is_file()
     }
     pub fn progress(&self) -> Result<Progress, String> {
         self.load("progress.json")
