@@ -112,6 +112,10 @@ with tempfile.TemporaryDirectory(prefix="openfelt-pty-") as root:
     g.send("\r")
     assert b"DECISION REPLAY" in ANSI.sub(b"", g.output)
     g.send("b")
+    # Bookmark persistence/redraw can exceed one read interval on busy CI runners.
+    deadline = time.monotonic() + 3
+    while b"BOOKMARKED" not in ANSI.sub(b"", g.output) and time.monotonic() < deadline:
+        g.read(0.1)
     assert b"BOOKMARKED" in ANSI.sub(b"", g.output)
     g.send("\x1b\x1b")
     assert g.process.poll() is None, "replay must return to the same live session"
