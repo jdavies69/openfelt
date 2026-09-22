@@ -61,6 +61,14 @@ name = "poker-train"
 path = "src/bin/poker_train.rs"
 
 [[bin]]
+name = "openfelt-replay"
+path = "src/bin/openfelt_replay.rs"
+
+[[bin]]
+name = "openfelt-eval"
+path = "src/bin/openfelt_eval.rs"
+
+[[bin]]
 name = "poker-benchmark"
 path = "src/bin/poker_benchmark.rs"
 

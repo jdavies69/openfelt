@@ -53,6 +53,7 @@ struct Ui {
     accounted_hands: u64,
     accounted_profit: i64,
     cash_saved: usize,
+    replay_saved: usize,
     saved_progress: Vec<u8>,
 }
 pub fn run(settings: Settings, store: Store) -> Result<(), Box<dyn std::error::Error>> {
@@ -74,6 +75,7 @@ pub fn run(settings: Settings, store: Store) -> Result<(), Box<dyn std::error::E
         accounted_hands: 0,
         accounted_profit: 0,
         cash_saved: 0,
+        replay_saved: 0,
         saved_progress: Vec::new(),
     };
     enable_raw_mode()?;
@@ -388,6 +390,16 @@ impl Ui {
             }
             self.cash_saved += 1;
         }
+        while self.replay_saved < self.session.replay_ready.len() {
+            if let Err(e) = store.append(
+                "completed-hands.jsonl",
+                &self.session.replay_ready[self.replay_saved],
+            ) {
+                self.status = e;
+                break;
+            }
+            self.replay_saved += 1;
+        }
     }
 }
 fn cards(cards: &[crate::game::deck::Card]) -> String {
@@ -643,6 +655,7 @@ mod tests {
             accounted_hands: 0,
             accounted_profit: 0,
             cash_saved: 0,
+            replay_saved: 0,
             saved_progress: vec![],
         }
     }

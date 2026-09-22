@@ -1,0 +1,5 @@
+[
+  {"id":"straightforward-check-call","category":"straightforward","seed":11},
+  {"id":"ambiguous-multiway-call","category":"ambiguous","seed":29},
+  {"id":"adversarial-hidden-information","category":"adversarial","seed":47}
+]

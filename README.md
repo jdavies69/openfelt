@@ -89,6 +89,10 @@ Cloud responses are schema-checked and strategic feedback is labeled heuristic. 
 
 OpenFelt uses the platform local-data folder plus `openfelt` (on macOS, normally `~/Library/Application Support/openfelt`). Nonsecret settings are saved only with `--save-settings`; decisions, concept counts, completed-hand stats, cash events and provider usage save locally. `--data-dir PATH` selects an isolated folder. Unix files are created with owner-only permissions. Keep private histories out of public bug reports. There is no automatic upload of history. Only new explicitly enabled cloud decisions are sent to the selected provider, whose privacy/billing terms apply.
 
+Completed hands can be browsed after a restart with `openfelt-replay list`, then `openfelt-replay show HAND_ID --decision 0`. Move forward or backward by changing the zero-based decision number. `openfelt-replay outcome HAND_ID` shows the separately stored final state. `openfelt-replay bookmark HAND_ID DECISION` saves a direct review target; `openfelt-replay bookmarks` lists them. Invalid history lines are skipped and reported without hiding valid hands. Replay decision views contain only the saved pre-decision information.
+
+Run `openfelt-eval` for the committed, reproducible offline coaching corpus and rubric report. It makes no provider calls. `--live` requires an API key plus explicit model, request count, and budget, but live adapter execution remains disabled until reviewed scenario decisions and dated price inputs are supplied. Offline fixture success does not establish live teaching quality.
+
 ## Development and provenance
 
 ```sh
