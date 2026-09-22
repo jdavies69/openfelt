@@ -54,6 +54,26 @@ pub struct Session {
     pub replay_ready: Vec<CompletedHand>,
 }
 impl Session {
+    pub fn result_summary(&self) -> Option<String> {
+        if !self.finished() || self.hand.awards.is_empty() {
+            return None;
+        }
+        let payouts = self
+            .hand
+            .awards
+            .iter()
+            .flat_map(|award| award.payouts.iter())
+            .map(|payout| {
+                let name = if payout.seat == hero() {
+                    "You".to_string()
+                } else {
+                    format!("Bot {}", payout.seat.as_u8())
+                };
+                format!("{name} won {}", payout.amount)
+            })
+            .collect::<Vec<_>>();
+        (!payouts.is_empty()).then(|| payouts.join(" · "))
+    }
     pub fn new(settings: Settings) -> Result<Self, String> {
         settings.validate()?;
         let table = TableSize::new(settings.seats).map_err(|e| e.to_string())?;

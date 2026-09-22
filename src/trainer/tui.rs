@@ -15,7 +15,6 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     style::{Color, Style},
-    text::Line,
     widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
@@ -1078,32 +1077,12 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
             ),
             format!("Status         {}", ui.status),
         ];
-        let lines = rows
-            .iter()
-            .enumerate()
-            .map(|(i, row)| {
-                Line::from(format!(
-                    "{} {row}",
-                    if i == editor.field { "›" } else { " " }
-                ))
-            })
-            .collect::<Vec<_>>();
-        let panel = ratatui::layout::Rect {
-            x: area.x + 4,
-            y: area.y + 3,
-            width: area.width.saturating_sub(8),
-            height: 18.min(area.height.saturating_sub(4)),
-        };
-        frame.render_widget(ratatui::widgets::Clear, panel);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!(" SETTINGS · credential source: {} ", editor.source)),
-                )
-                .wrap(Wrap { trim: false }),
-            panel,
+        super::table_ui::render_settings_panel(
+            frame,
+            area,
+            &format!("SETTINGS · credential: {}", editor.source),
+            &rows,
+            editor.field,
         );
         return;
     }
@@ -1128,24 +1107,13 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
         let explanation = if ui.session.settings.coaching == CoachingMode::Off {
             "Coaching off. Your decision is accepted.".into()
         } else if let Some(f) = &ui.feedback {
-            format!(
-                "{} · {} ({})\n{}",
-                f.concept,
-                f.assessment,
-                if ui.provider_feedback {
-                    "provider heuristic"
-                } else {
-                    "local heuristic"
-                },
-                humanize_coaching(&f.explanation)
-            )
+            if ui.deep {
+                format!("{}\n{}", f.concept, humanize_coaching(&f.explanation))
+            } else {
+                collapsed_coaching_explanation(f)
+            }
         } else {
             "Coaching unavailable".into()
-        };
-        let explanation = if ui.deep {
-            explanation
-        } else {
-            format!("{}\n… ? read full feedback", excerpt(&explanation, 112))
         };
         let details = if ui.deep {
             format!(
@@ -1161,22 +1129,14 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
         };
         (
             " AFTER YOUR DECISION ",
-            format!(
-                "You {}. The visible hand is frozen.\nEnter continues · ? {} · Q quits\n{}{}{}",
-                d.accepted_action.description(),
-                if ui.deep {
-                    "close details"
-                } else {
-                    "read full feedback"
-                },
-                explanation,
-                details,
-                if ui.deep {
-                    "\n↑/↓ scroll · PgUp/PgDn page · Esc closes"
-                } else {
-                    ""
-                }
-            ),
+            structured_coaching_copy(
+                d,
+                &explanation,
+                ui.feedback
+                    .as_ref()
+                    .and_then(|f| f.alternative_action.as_deref()),
+                ui.deep,
+            ) + &details,
         )
     } else if ui.session.finished() {
         let practice = ui
@@ -1184,7 +1144,7 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
             .as_ref()
             .map(|note| format!("\n{note}"))
             .unwrap_or_default();
-        (" HAND COMPLETE ",format!("Session profit: {:+} chips (excludes top-ups and withdrawals).\nProgress: {} completed hands · {} decisions reviewed.\nEnter next hand · B top up/rebuy to 100BB · W withdraw chips\nBot busts rebuy automatically and are recorded as external chip additions.{practice}",ui.session.session_profit,ui.progress.hands,ui.progress.decisions))
+        (" HAND COMPLETE ",format!("{}\nSession profit: {:+} chips (excludes top-ups and withdrawals).\nProgress: {} completed hands · {} decisions reviewed.\nEnter next hand · V replay · B top up · W withdraw{practice}",ui.session.result_summary().unwrap_or_else(|| "Hand settled".into()),ui.session.session_profit,ui.progress.hands,ui.progress.decisions))
     } else if p.to_act == Some(hero()) {
         (
             " YOUR NEXT DECISION ",
@@ -1224,10 +1184,25 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
             .session
             .observation(hero())
             .ok()
-            .map(|observation| raise_view(&observation, amount)),
+            .map(|observation| raise_view_for(&observation, amount)),
         _ => None,
     };
     let actions = ui.session.recent_actions();
+    let hand_label = ui
+        .session
+        .coaching
+        .as_ref()
+        .map(|d| present_hand_label(&d.facts.hand_classification))
+        .or_else(|| {
+            ui.session.observation(hero()).ok().map(|o| {
+                present_hand_label(&super::facts::Facts::calculate(&o).hand_classification)
+            })
+        });
+    let (review_tone, guidance_source) = review_presentation(
+        ui.feedback.as_ref(),
+        ui.provider_feedback,
+        ui.pending.is_some(),
+    );
     super::table_ui::render(
         frame,
         &super::table_ui::TableRenderState {
@@ -1240,6 +1215,9 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
             notice_title: Some(title.trim()),
             notice: Some(&body),
             raise,
+            hand_label: hand_label.as_deref(),
+            review_tone,
+            guidance_source,
         },
     );
 
@@ -1268,7 +1246,33 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
     }
 }
 
-fn raise_view(observation: &super::facts::Observation, text: &str) -> super::table_ui::RaiseView {
+fn review_presentation(
+    feedback: Option<&Feedback>,
+    provider_feedback: bool,
+    pending: bool,
+) -> (Option<super::table_ui::ReviewTone>, Option<&'static str>) {
+    if pending {
+        return (
+            Some(super::table_ui::ReviewTone::Uncertain),
+            Some("Awaiting provider heuristic"),
+        );
+    }
+    let tone =
+        feedback.map(|feedback| super::table_ui::ReviewTone::from_assessment(&feedback.assessment));
+    let source = feedback.map(|_| {
+        if provider_feedback {
+            "AI suggestion · heuristic"
+        } else {
+            "Local guidance · heuristic"
+        }
+    });
+    (tone, source)
+}
+
+pub fn raise_view_for(
+    observation: &super::facts::Observation,
+    text: &str,
+) -> super::table_ui::RaiseView {
     let minimum = observation
         .legal
         .min_raise_to
@@ -1284,6 +1288,7 @@ fn raise_view(observation: &super::facts::Observation, text: &str) -> super::tab
         minimum,
         maximum,
         presets: raise_presets(observation),
+        is_bet: observation.legal.min_bet_to.is_some(),
     }
 }
 
@@ -1310,21 +1315,80 @@ fn raise_presets(observation: &super::facts::Observation) -> [u32; 5] {
             .saturating_add(base.saturating_mul(numerator).div_ceil(denominator))
             .clamp(minimum, maximum)
     };
-    [
-        minimum,
-        target(1, 2),
-        target(3, 4),
-        target(1, 1),
-        target(3, 2),
-    ]
+    [minimum, target(1, 2), target(3, 4), target(1, 1), maximum]
 }
 
-fn humanize_coaching(copy: &str) -> String {
+fn accepted_action_copy(action: &Action) -> String {
+    match action {
+        Action::Fold => "You folded".into(),
+        Action::Check => "You checked".into(),
+        Action::Call(amount) => format!("You called {amount}"),
+        Action::Bet(amount) => format!("You bet to {amount}"),
+        Action::Raise(amount) => format!("You raised to {amount}"),
+        Action::AllIn(amount) => format!("You moved all-in to {amount}"),
+    }
+}
+
+pub fn present_hand_label(label: &str) -> String {
+    if let Some(rank) = label.strip_suffix(" high") {
+        let lower = rank.to_ascii_lowercase();
+        let singular = match lower.as_str() {
+            "aces" => "Ace",
+            "kings" => "King",
+            "queens" => "Queen",
+            "jacks" => "Jack",
+            "tens" => "Ten",
+            "nines" => "Nine",
+            "eights" => "Eight",
+            "sevens" => "Seven",
+            "sixes" => "Six",
+            "fives" => "Five",
+            "fours" => "Four",
+            "threes" => "Three",
+            "twos" => "Two",
+            other => other,
+        };
+        return format!("{singular}-high");
+    }
+    let mut chars = label.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+        .unwrap_or_default()
+}
+
+pub fn structured_coaching_copy(
+    decision: &super::facts::Decision,
+    explanation: &str,
+    alternative: Option<&str>,
+    deep: bool,
+) -> String {
+    format!(
+        "BEFORE ACTION  pot {} · stack {}  ·  YOUR ACTION  {}\nWHY  {}\nCONSIDER  {}{}",
+        decision.observation.pot,
+        decision.observation.own().stack,
+        accepted_action_copy(&decision.accepted_action),
+        explanation,
+        alternative.unwrap_or("Review the price, position, and remaining stacks."),
+        if deep {
+            "\nFull reasoning shown above."
+        } else {
+            ""
+        },
+    )
+}
+
+pub fn humanize_coaching(copy: &str) -> String {
     copy.replace("LateOpen", "late-position range")
+        .replace("Late", "late-position")
         .replace("Premium", "premium range")
         .replace("Strong", "strong range")
         .replace("Marginal", "marginal range")
         .replace("Fold", "folding range")
+}
+
+pub fn collapsed_coaching_explanation(feedback: &Feedback) -> String {
+    excerpt(&humanize_coaching(&feedback.explanation), 46)
 }
 
 fn excerpt(copy: &str, limit: usize) -> String {
@@ -1420,7 +1484,7 @@ mod tests {
         assert!(screen.contains("sk-••••••••abcd"));
         assert!(!screen.contains("sk-secretabcd"));
         assert!(screen.contains("explicit one-request check"));
-        assert!(screen.contains("credential source: Keyring"));
+        assert!(screen.contains("credential: Keyring"));
         assert!(screen.contains("Ctrl-V reveal"));
         assert!(screen.contains("Ctrl-X forget"));
         assert!(screen.contains("Updates"));
@@ -1539,13 +1603,16 @@ mod tests {
         let d = ui.session.submit(action).unwrap();
         ui.feedback = Some(local_feedback(d));
         let text = rendered(&ui, 80, 30);
-        assert!(text.contains("HAND PAUSED"));
-        assert!(text.contains("ENTER TO CONTINUE"));
+        assert!(text.contains("TABLE BEFORE ACTION"));
+        assert!(text.contains("YOUR ACTION"));
+        assert!(text.contains("WHY"));
+        assert!(text.contains("CONSIDER"));
+        assert!(text.contains("Enter continue"));
         ui.deep = true;
         let text = rendered(&ui, 80, 30);
         assert!(text.contains("Legal call:"));
         assert!(text.contains("Contestable pot assumes"));
-        assert!(text.contains("Enter continues"));
+        assert!(text.contains("Enter continue"));
         assert!(!text.contains("[hidden]"));
 
         ui.feedback.as_mut().unwrap().explanation = format!(
@@ -1597,12 +1664,75 @@ mod tests {
             .or(observation.legal.min_bet_to)
             .unwrap();
         let maximum = observation.legal.all_in_to;
-        assert_eq!(raise_view(&observation, "0").amount, minimum);
+        assert_eq!(raise_view_for(&observation, "0").amount, minimum);
         assert_eq!(clamp_raise(&observation, 0), minimum);
-        assert_eq!(raise_view(&observation, "999999").amount, maximum);
+        assert_eq!(raise_view_for(&observation, "999999").amount, maximum);
         assert_eq!(clamp_raise(&observation, 999_999), maximum);
         assert!(raise_presets(&observation)
             .into_iter()
             .all(|amount| (minimum..=maximum).contains(&amount)));
+        assert_eq!(raise_presets(&observation)[4], maximum);
+    }
+
+    #[test]
+    fn pending_provider_review_is_neutral_until_validated_feedback_arrives() {
+        let mut ui = ui(2);
+        while ui.session.view().to_act != Some(hero()) {
+            ui.session.step_bot().unwrap();
+        }
+        let action = ui.session.observation(hero()).unwrap().check_call();
+        let decision = ui.session.submit(action).unwrap();
+        let mut feedback = local_feedback(decision);
+        feedback.assessment = "reasonable".into();
+        assert_eq!(
+            review_presentation(Some(&feedback), false, false),
+            (
+                Some(crate::trainer::table_ui::ReviewTone::Good),
+                Some("Local guidance · heuristic")
+            )
+        );
+        assert_eq!(
+            review_presentation(Some(&feedback), false, true),
+            (
+                Some(crate::trainer::table_ui::ReviewTone::Uncertain),
+                Some("Awaiting provider heuristic")
+            )
+        );
+        feedback.assessment = "reconsider".into();
+        assert_eq!(
+            review_presentation(Some(&feedback), false, false).0,
+            Some(crate::trainer::table_ui::ReviewTone::Reconsider)
+        );
+        feedback.assessment = "uncertain".into();
+        assert_eq!(
+            review_presentation(Some(&feedback), true, false),
+            (
+                Some(crate::trainer::table_ui::ReviewTone::Uncertain),
+                Some("AI suggestion · heuristic")
+            )
+        );
+    }
+
+    #[test]
+    fn compact_paused_tables_keep_every_seat_and_review_step_visible() {
+        for seats in [6, 9] {
+            let mut ui = ui(seats);
+            while ui.session.view().to_act != Some(hero()) {
+                ui.session.step_bot().unwrap();
+            }
+            let action = ui.session.observation(hero()).unwrap().check_call();
+            let decision = ui.session.submit(action).unwrap();
+            ui.feedback = Some(local_feedback(decision));
+            let projection = ui.session.view();
+            let text = rendered(&ui, 80, 30);
+            for seat in projection.seats.iter().filter(|seat| seat.seat != hero()) {
+                assert!(text.contains(&format!("bot {}", seat.seat.as_u8())));
+                assert!(text.contains(&seat.stack.to_string()));
+            }
+            for label in ["TABLE BEFORE ACTION", "YOUR ACTION", "WHY", "CONSIDER"] {
+                assert!(text.contains(label), "missing {label} at {seats} seats");
+            }
+            assert_eq!(text.matches("Enter continue").count(), 1);
+        }
     }
 }

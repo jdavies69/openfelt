@@ -38,12 +38,29 @@ pub enum TableMode {
     Complete,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewTone {
+    Good,
+    Reconsider,
+    Uncertain,
+}
+impl ReviewTone {
+    pub fn from_assessment(assessment: &str) -> Self {
+        match assessment {
+            "reasonable" => Self::Good,
+            "reconsider" => Self::Reconsider,
+            _ => Self::Uncertain,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RaiseView {
     pub amount: u32,
     pub minimum: u32,
     pub maximum: u32,
     pub presets: [u32; 5],
+    pub is_bet: bool,
 }
 
 pub struct TableRenderState<'a> {
@@ -56,6 +73,9 @@ pub struct TableRenderState<'a> {
     pub notice_title: Option<&'a str>,
     pub notice: Option<&'a str>,
     pub raise: Option<RaiseView>,
+    pub hand_label: Option<&'a str>,
+    pub review_tone: Option<ReviewTone>,
+    pub guidance_source: Option<&'a str>,
 }
 
 pub fn render(frame: &mut Frame<'_>, state: &TableRenderState<'_>) {
@@ -73,18 +93,43 @@ pub fn render(frame: &mut Frame<'_>, state: &TableRenderState<'_>) {
         return;
     }
 
-    let rows = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(20),
-        Constraint::Length(6),
-        Constraint::Length(1),
-    ])
-    .split(area);
+    let shell_width = area.width.min(128);
+    let shell_height = area.height.min(38);
+    let shell = Rect::new(
+        area.x + area.width.saturating_sub(shell_width) / 2,
+        area.y + area.height.saturating_sub(shell_height) / 2,
+        shell_width,
+        shell_height,
+    );
+    let paused = state.mode == TableMode::Paused;
+    let rows = if paused {
+        Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Min(14),
+            Constraint::Length(8),
+            Constraint::Length(1),
+        ])
+        .split(shell)
+    } else {
+        Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Min(20),
+            Constraint::Length(6),
+            Constraint::Length(1),
+        ])
+        .split(shell)
+    };
     render_header(frame, state, rows[0]);
-    let body = Layout::horizontal([Constraint::Min(56), Constraint::Length(23)]).split(rows[1]);
+    let rail_width = if shell.width >= 110 { 28 } else { 23 };
+    let body =
+        Layout::horizontal([Constraint::Min(56), Constraint::Length(rail_width)]).split(rows[1]);
     render_stage(frame, state, body[0]);
     render_rail(frame, state, body[1]);
-    render_controls(frame, state, rows[2]);
+    if paused {
+        render_coaching(frame, state, rows[2]);
+    } else {
+        render_controls(frame, state, rows[2]);
+    }
     let footer =
         Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).split(rows[3]);
     frame.render_widget(
@@ -106,6 +151,148 @@ pub fn render(frame: &mut Frame<'_>, state: &TableRenderState<'_>) {
     );
 }
 
+pub fn render_settings_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    rows: &[String],
+    selected: usize,
+) {
+    let width = area.width.saturating_sub(8).min(92);
+    let height = (rows.len() as u16 + 4).min(area.height.saturating_sub(4));
+    let panel = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let lines = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let active = index == selected;
+            Line::from(vec![
+                Span::styled(
+                    if active { " › " } else { "   " },
+                    Style::default().fg(if active { GREEN } else { MUTED }),
+                ),
+                Span::styled(
+                    row.clone(),
+                    Style::default()
+                        .fg(if active { TEXT } else { MUTED })
+                        .add_modifier(if active {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, panel);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(PANEL))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(GREEN))
+                    .style(Style::default().bg(PANEL))
+                    .title(Span::styled(
+                        format!(" {title} "),
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    )),
+            ),
+        panel,
+    );
+}
+
+fn render_coaching(frame: &mut Frame<'_>, state: &TableRenderState<'_>, area: Rect) {
+    let title = state.notice_title.unwrap_or("REVIEW");
+    let (badge, color) = match state.review_tone.unwrap_or(ReviewTone::Uncertain) {
+        ReviewTone::Good => ("✓ GOOD DECISION", GREEN),
+        ReviewTone::Reconsider => ("! REVIEW THIS", YELLOW),
+        ReviewTone::Uncertain => ("? UNCERTAIN", MUTED),
+    };
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(GREEN))
+        .style(Style::default().bg(PANEL))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rows[0]);
+    frame.render_widget(block, rows[0]);
+    let copy = state.notice.unwrap_or(state.status);
+    let receipt = copy
+        .lines()
+        .find(|line| line.starts_with("BEFORE ACTION"))
+        .unwrap_or("");
+    let why = copy
+        .lines()
+        .find(|line| line.starts_with("WHY"))
+        .unwrap_or("");
+    let consider = copy
+        .lines()
+        .find(|line| line.starts_with("CONSIDER"))
+        .unwrap_or("");
+    let fields = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" {badge} "),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  {}",
+                    state.guidance_source.unwrap_or("heuristic guidance")
+                ),
+                Style::default().fg(MUTED),
+            ),
+        ])),
+        fields[0],
+    );
+    frame.render_widget(
+        Paragraph::new(receipt).style(Style::default().fg(TEXT)),
+        fields[1],
+    );
+    frame.render_widget(
+        Paragraph::new(why)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(TEXT)),
+        fields[2],
+    );
+    frame.render_widget(
+        Paragraph::new(consider).style(Style::default().fg(TEXT)),
+        fields[3],
+    );
+    frame.render_widget(
+        Paragraph::new("Enter continue  ·  ? full explanation")
+            .alignment(Alignment::Center)
+            .style(
+                Style::default()
+                    .fg(TEXT)
+                    .bg(GREEN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        rows[1],
+    );
+}
+
 /// Expanded coaching keeps the hero cards and controls visible below a wide,
 /// readable teaching panel.
 pub fn render_coaching_details(frame: &mut Frame<'_>, title: &str, body: &str, scroll: u16) {
@@ -117,10 +304,11 @@ pub fn render_coaching_details(frame: &mut Frame<'_>, title: &str, body: &str, s
         area.height.saturating_sub(15),
     );
     frame.render_widget(Clear, panel);
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(panel);
     frame.render_widget(
         Paragraph::new(body)
             .scroll((
-                scroll.min(coaching_max_scroll(body, panel.width, panel.height)),
+                scroll.min(coaching_max_scroll(body, rows[0].width, rows[0].height)),
                 0,
             ))
             .style(Style::default().fg(TEXT).bg(BG))
@@ -132,7 +320,18 @@ pub fn render_coaching_details(frame: &mut Frame<'_>, title: &str, body: &str, s
                     .border_style(Style::default().fg(GREEN))
                     .style(Style::default().bg(BG)),
             ),
-        panel,
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new("↑/↓ scroll · PgUp/PgDn page · Esc close · Enter continue")
+            .alignment(Alignment::Center)
+            .style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(GREEN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        rows[1],
     );
 }
 
@@ -203,7 +402,20 @@ fn render_header(frame: &mut Frame<'_>, state: &TableRenderState<'_>, area: Rect
 }
 
 fn render_stage(frame: &mut Frame<'_>, state: &TableRenderState<'_>, area: Rect) {
-    let seat_w = if area.width >= 70 { 14 } else { 12 };
+    let stage_height = area.height.min(26);
+    let area = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(stage_height) / 2,
+        area.width,
+        stage_height,
+    );
+    let seat_w = if area.width >= 90 {
+        16
+    } else if area.width >= 70 {
+        14
+    } else {
+        12
+    };
     let table = Rect::new(
         area.x + seat_w / 2,
         area.y + 6,
@@ -220,6 +432,26 @@ fn render_stage(frame: &mut Frame<'_>, state: &TableRenderState<'_>, area: Rect)
     );
     render_board(frame, state.projection, table);
     render_seats(frame, state, area, table, seat_w);
+    if let Some(label) = state.hand_label {
+        let label_width = table.width.saturating_sub(2).min(34);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("YOUR HAND  ", Style::default().fg(MUTED)),
+                Span::styled(
+                    label,
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+            ]))
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(TABLE)),
+            Rect::new(
+                table.x + table.width.saturating_sub(label_width) / 2,
+                table.y + 1,
+                label_width,
+                1,
+            ),
+        );
+    }
 }
 
 fn render_board(frame: &mut Frame<'_>, projection: &TableProjection, table: Rect) {
@@ -241,10 +473,22 @@ fn render_board(frame: &mut Frame<'_>, projection: &TableProjection, table: Rect
         Rect::new(table.x + 1, center_y.saturating_sub(3), table.width - 2, 1),
     );
     let slots = if table.width >= 27 { 5 } else { 3 };
-    let width = slots * 5 - 1;
+    let card_w = if table.width >= 72 && table.height >= 11 {
+        7
+    } else {
+        4
+    };
+    let card_h = if card_w == 7 { 5 } else { 3 };
+    let gap = 1;
+    let width = slots * (card_w + gap) - gap;
     let x = table.x + table.width.saturating_sub(width) / 2;
     for index in 0..slots {
-        let card_area = Rect::new(x + index * 5, center_y.saturating_sub(1), 4, 3);
+        let card_area = Rect::new(
+            x + index * (card_w + gap),
+            center_y.saturating_sub(card_h / 2),
+            card_w,
+            card_h,
+        );
         if let Some(card) = projection.board.get(index as usize) {
             render_card(frame, card_area, card);
         } else {
@@ -270,11 +514,17 @@ fn render_seats(
             .find(|candidate| candidate.seat.as_u8() == seat_id);
         render_seat(frame, state, seat, rect, false, table);
     }
+    let hero_h = if stage.width >= 90 && stage.height >= 22 {
+        7
+    } else {
+        5
+    };
+    let hero_w = if hero_h == 7 { 28 } else { 22 };
     let hero_rect = Rect::new(
-        table.x + table.width.saturating_sub(22) / 2,
-        stage.y + stage.height.saturating_sub(5),
-        22.min(table.width),
-        5,
+        table.x + table.width.saturating_sub(hero_w) / 2,
+        stage.y + stage.height.saturating_sub(hero_h),
+        hero_w.min(table.width),
+        hero_h,
     );
     let hero_seat = state
         .projection
@@ -359,7 +609,7 @@ fn opponent_rect(index: u8, count: u8, stage: Rect, _table: Rect, width: u16) ->
             },
         ),
     };
-    Rect::new(x, y, width, 6)
+    Rect::new(x, y, width, if stage.height < 20 { 4 } else { 6 })
 }
 
 fn render_seat(
@@ -408,13 +658,14 @@ fn render_seat(
     frame.render_widget(block, area);
     if hero_seat {
         if let Some(cards) = &seat.hole_cards {
-            let width = 5;
+            let width = if inner.height >= 5 { 7 } else { 5 };
+            let height = if inner.height >= 5 { 5 } else { 3 };
             let total = width * 2 + 1;
             let start = inner.x + inner.width.saturating_sub(total) / 2;
             for (index, card) in cards.iter().take(2).enumerate() {
                 render_card(
                     frame,
-                    Rect::new(start + index as u16 * (width + 1), inner.y, width, 3),
+                    Rect::new(start + index as u16 * (width + 1), inner.y, width, height),
                     card,
                 );
             }
@@ -498,7 +749,12 @@ fn render_opponent_holding(frame: &mut Frame<'_>, area: Rect, seat: &ProjectedSe
         for index in 0..2 {
             render_card_back(
                 frame,
-                Rect::new(start + index * (card_width + 1), area.y + 1, card_width, 3),
+                Rect::new(
+                    start + index * (card_width + 1),
+                    area.y + 1,
+                    card_width,
+                    area.height.saturating_sub(1).min(3),
+                ),
             );
         }
     } else {
@@ -507,18 +763,25 @@ fn render_opponent_holding(frame: &mut Frame<'_>, area: Rect, seat: &ProjectedSe
         } else {
             "waiting"
         };
-        frame.render_widget(
-            Paragraph::new(vec![
+        let lines = if area.height < 3 {
+            vec![
+                Line::from(Span::styled(
+                    seat.stack.to_string(),
+                    Style::default().fg(TEXT),
+                )),
+                Line::from(Span::styled(status, Style::default().fg(MUTED))),
+            ]
+        } else {
+            vec![
                 Line::from(Span::styled(
                     seat.stack.to_string(),
                     Style::default().fg(TEXT),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(status, Style::default().fg(MUTED))),
-            ])
-            .alignment(Alignment::Center),
-            area,
-        );
+            ]
+        };
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
     }
 }
 
@@ -550,28 +813,30 @@ fn render_card(frame: &mut Frame<'_>, area: Rect, card: &Card) {
         .bg(CARD_FACE)
         .add_modifier(Modifier::BOLD);
     let width = usize::from(area.width);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(rank.to_string(), face),
-                Span::styled(" ".repeat(width.saturating_sub(1)), face),
-            ]),
-            Line::from(Span::styled(
-                format!(
-                    "{}{}{}",
-                    " ".repeat(width.saturating_sub(1) / 2),
-                    card.suit.symbol(),
-                    " ".repeat(width.saturating_sub(width.saturating_sub(1) / 2 + 1))
-                ),
-                face,
-            )),
-            Line::from(vec![
-                Span::styled(" ".repeat(width.saturating_sub(1)), face),
-                Span::styled(rank.to_string(), face),
-            ]),
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(rank.to_string(), face),
+            Span::styled(" ".repeat(width.saturating_sub(1)), face),
         ]),
-        area,
-    );
+        Line::from(Span::styled(
+            format!(
+                "{}{}{}",
+                " ".repeat(width.saturating_sub(1) / 2),
+                card.suit.symbol(),
+                " ".repeat(width.saturating_sub(width.saturating_sub(1) / 2 + 1))
+            ),
+            face,
+        )),
+        Line::from(vec![
+            Span::styled(" ".repeat(width.saturating_sub(1)), face),
+            Span::styled(rank.to_string(), face),
+        ]),
+    ];
+    if area.height >= 5 {
+        lines.insert(2, Line::from(Span::styled(" ".repeat(width), face)));
+        lines.insert(3, Line::from(Span::styled(" ".repeat(width), face)));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_empty_card(frame: &mut Frame<'_>, area: Rect) {
@@ -607,25 +872,37 @@ fn render_rail(frame: &mut Frame<'_>, state: &TableRenderState<'_>, area: Rect) 
             Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
         )),
     ];
-    if let Some(title) = state.notice_title {
+    if state.mode == TableMode::Paused {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "TABLE BEFORE ACTION",
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Pot, stacks and cards are frozen for review.",
+            Style::default().fg(TEXT),
+        )));
+    } else if let Some(title) = state.notice_title {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             title,
             Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
         )));
     }
-    if let Some(notice) = state.notice {
-        for line in notice.lines() {
+    if state.mode != TableMode::Paused {
+        if let Some(notice) = state.notice {
+            for line in notice.lines() {
+                lines.push(Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(TEXT),
+                )));
+            }
+        } else if !state.status.is_empty() {
             lines.push(Line::from(Span::styled(
-                line.to_string(),
+                state.status,
                 Style::default().fg(TEXT),
             )));
         }
-    } else if !state.status.is_empty() {
-        lines.push(Line::from(Span::styled(
-            state.status,
-            Style::default().fg(TEXT),
-        )));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -692,6 +969,15 @@ fn render_controls(frame: &mut Frame<'_>, state: &TableRenderState<'_>, area: Re
         .alignment(Alignment::Center),
         banner,
     );
+    if state.mode == TableMode::Complete {
+        frame.render_widget(
+            Paragraph::new("Enter next hand  ·  V replay  ·  B top up  ·  W withdraw")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(TEXT).bg(PANEL)),
+            Rect::new(area.x + 5, area.y + 2, area.width.saturating_sub(10), 2),
+        );
+        return;
+    }
     let buttons = Layout::horizontal([
         Constraint::Percentage(28),
         Constraint::Length(1),
@@ -724,7 +1010,12 @@ fn render_controls(frame: &mut Frame<'_>, state: &TableRenderState<'_>, area: Re
         TEAL,
         can_check_call,
     );
-    action_button(frame, buttons[4], "r  RAISE", MUSTARD, can_raise);
+    let wager_label = if legal.is_some_and(|legal| legal.min_bet_to.is_some()) {
+        "r  BET"
+    } else {
+        "r  RAISE"
+    };
+    action_button(frame, buttons[4], wager_label, MUSTARD, can_raise);
 }
 
 fn action_button(frame: &mut Frame<'_>, area: Rect, label: &str, color: Color, enabled: bool) {
@@ -756,10 +1047,11 @@ fn render_raise(frame: &mut Frame<'_>, raise: RaiseView, area: Rect) {
     );
     frame.render_widget(Clear, overlay);
     let mut preset_spans = Vec::new();
+    let labels = ["min", "½ pot", "¾ pot", "pot", "all-in"];
     for (index, amount) in raise.presets.iter().enumerate() {
         let selected = *amount == raise.amount;
         preset_spans.push(Span::styled(
-            format!(" {} {} ", index + 1, amount),
+            format!(" {} {} {} ", index + 1, labels[index], amount),
             Style::default()
                 .fg(if selected { Color::Black } else { MUTED })
                 .bg(if selected { TEAL } else { PANEL })
@@ -781,7 +1073,14 @@ fn render_raise(frame: &mut Frame<'_>, raise: RaiseView, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled("RAISE TO", Style::default().fg(MUTED))),
+            Line::from(Span::styled(
+                if raise.is_bet {
+                    "BET TO · total street chips"
+                } else {
+                    "RAISE TO · total street chips"
+                },
+                Style::default().fg(MUTED),
+            )),
             Line::from(preset_spans),
             Line::from(vec![
                 Span::styled(

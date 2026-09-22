@@ -8,15 +8,23 @@ use terminal_poker::trainer::{
     hero,
     storage::Settings,
     table_ui::{self, RaiseView, TableMode, TableRenderState},
+    tui::{
+        collapsed_coaching_explanation, present_hand_label, raise_view_for,
+        structured_coaching_copy,
+    },
     Session,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = env::args().nth(1).ok_or("output directory required")?;
     fs::create_dir_all(&output)?;
-    for seats in [2, 6, 9] {
+    for seats in [3, 6, 9] {
         let mut session = hero_turn(seats)?;
-        for (width, height) in [(80, 30), (100, 36)] {
+        let mut sizes = vec![(80, 30), (100, 36)];
+        if seats == 3 {
+            sizes.push((176, 48));
+        }
+        for (width, height) in sizes {
             capture(
                 &output,
                 &format!("trainer-{seats}seat-hero-{width}x{height}"),
@@ -30,22 +38,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
             )?;
         }
+        if seats == 3 {
+            let postflop = postflop_hero_turn()?;
+            capture(
+                &output,
+                "trainer-3seat-flop-176x48",
+                176,
+                48,
+                &postflop,
+                TableMode::Playing,
+                Some("YOUR NEXT DECISION"),
+                Some("Read the current board and choose your action."),
+                None,
+                None,
+            )?;
+        }
+        if seats == 9 {
+            let observation = session.observation(hero())?;
+            let decision = session.submit(observation.check_call())?;
+            let feedback = local_feedback(decision);
+            let explanation = collapsed_coaching_explanation(&feedback);
+            let coaching = structured_coaching_copy(
+                decision,
+                &explanation,
+                feedback.alternative_action.as_deref(),
+                false,
+            );
+            capture(
+                &output,
+                "trainer-9seat-coaching-80x30",
+                80,
+                30,
+                &session,
+                TableMode::Paused,
+                Some("AFTER YOUR DECISION"),
+                Some(&coaching),
+                None,
+                None,
+            )?;
+        }
         if seats == 6 {
             let observation = session.observation(hero())?;
-            let minimum = observation
-                .legal
-                .min_raise_to
-                .or(observation.legal.min_bet_to)
-                .unwrap_or(observation.legal.all_in_to);
-            let maximum = observation.legal.all_in_to;
-            let spread = maximum.saturating_sub(minimum);
-            let presets = [
-                minimum,
-                minimum + spread / 4,
-                minimum + spread / 2,
-                minimum + spread.saturating_mul(3) / 4,
-                maximum,
-            ];
+            let raise = raise_view_for(&observation, "0");
             capture(
                 &output,
                 "trainer-6seat-raise-100x36",
@@ -56,25 +90,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some("YOUR NEXT DECISION"),
                 Some("Choose a total street amount."),
                 Some(RaiseView {
-                    amount: presets[2],
-                    minimum,
-                    maximum,
-                    presets,
+                    amount: raise.presets[2],
+                    ..raise
+                }),
+                None,
+            )?;
+            capture(
+                &output,
+                "trainer-6seat-raise-176x48",
+                176,
+                48,
+                &session,
+                TableMode::Playing,
+                Some("YOUR NEXT DECISION"),
+                Some("Choose a legal total street amount."),
+                Some(RaiseView {
+                    amount: raise.presets[3],
+                    ..raise
                 }),
                 None,
             )?;
             let decision = session.submit(observation.check_call())?;
             let feedback = local_feedback(decision);
-            let coaching = format!(
-                "You {}. The visible hand is frozen.\nEnter continues · ? details\n{} · {}\n{}\nLegal call: {} chips. Contestable pot after call: {} chips.",
-                decision.accepted_action.description(),
-                feedback.concept,
-                feedback.assessment,
-                feedback.explanation.replace("LateOpen", "late-position range"),
+            let explanation = collapsed_coaching_explanation(&feedback);
+            let coaching = structured_coaching_copy(
+                decision,
+                &explanation,
+                feedback.alternative_action.as_deref(),
+                false,
+            );
+            let deep = format!(
+                "{}\nLegal call: {} chips. Contestable pot after call: {} chips.\n{}",
+                structured_coaching_copy(
+                    decision,
+                    &explanation,
+                    feedback.alternative_action.as_deref(),
+                    true,
+                ),
                 decision.facts.call_cost,
                 decision.facts.contestable_pot_after_call,
+                decision.facts.assumptions[0],
             );
-            for (width, height) in [(80, 30), (100, 36)] {
+            for (width, height) in [(80, 30), (100, 36), (176, 48)] {
                 capture(
                     &output,
                     &format!("trainer-6seat-coaching-{width}x{height}"),
@@ -95,15 +152,133 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &session,
                     TableMode::Paused,
                     Some("AFTER YOUR DECISION"),
-                    Some("Enter continues · ? close details"),
+                    Some(&coaching),
                     None,
-                    Some((&coaching, " AFTER YOUR DECISION ")),
+                    Some((&deep, " AFTER YOUR DECISION ")),
                 )?;
+            }
+            session.continue_hand();
+            finish_hand(&mut session)?;
+            capture(
+                &output,
+                "trainer-6seat-complete-100x36",
+                100,
+                36,
+                &session,
+                TableMode::Complete,
+                Some("HAND COMPLETE"),
+                session.result_summary().as_deref(),
+                None,
+                None,
+            )?;
+        }
+    }
+    capture_settings(&output, 100, 36)?;
+    println!("TRAINER_TABLE_CAPTURES_PASS {output}");
+    Ok(())
+}
+
+fn finish_hand(session: &mut Session) -> Result<(), String> {
+    for _ in 0..256 {
+        if session.finished() {
+            return Ok(());
+        }
+        if session.view().to_act == Some(hero()) {
+            let observation = session.observation(hero())?;
+            session.submit(observation.check_call())?;
+            session.continue_hand();
+        } else {
+            session.step_bot()?;
+        }
+    }
+    Err("fixture did not finish".into())
+}
+
+fn capture_settings(
+    output: impl AsRef<Path>,
+    width: u16,
+    height: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rows = vec![
+        "Provider       Local".to_string(),
+        "Model          (none)  [←/→ curated · E custom]".to_string(),
+        "API key        (leave unchanged)".to_string(),
+        "Session limit  5 requests".to_string(),
+        "Table          6 seats · 1/2 blinds".to_string(),
+        "Opponents      Standard".to_string(),
+        "Test key       explicit one-request check".to_string(),
+        "Save and return".to_string(),
+        "Updates        no check performed".to_string(),
+        "Cloud limits   600 output tokens · budget unset".to_string(),
+        "Status         Settings are local until saved".to_string(),
+    ];
+    let mut terminal = Terminal::new(TestBackend::new(width, height))?;
+    terminal.draw(|frame| {
+        table_ui::render_settings_panel(
+            frame,
+            frame.area(),
+            "SETTINGS · credential: none",
+            &rows,
+            4,
+        )
+    })?;
+    let cells: Vec<_> = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| {
+            json!({
+                "symbol": cell.symbol(), "foreground": format!("{:?}", cell.fg),
+                "background": format!("{:?}", cell.bg), "modifiers": cell.modifier.bits(),
+            })
+        })
+        .collect();
+    fs::write(
+        output.as_ref().join("trainer-settings-100x36.json"),
+        serde_json::to_vec_pretty(&json!({
+            "renderer":"terminal_poker::trainer::table_ui::render_settings_panel", "backend":"ratatui::backend::TestBackend",
+            "fixture":"trainer-settings-100x36", "width":width, "height":height, "cells":cells,
+        }))?,
+    )?;
+    Ok(())
+}
+
+fn postflop_hero_turn() -> Result<Session, String> {
+    for seed in 1..=2_000 {
+        let mut session = Session::new_seeded_for_evaluation(
+            Settings {
+                seats: 3,
+                ..Settings::default()
+            },
+            seed,
+        )?;
+        for _ in 0..96 {
+            let view = session.view();
+            if view.phase.name() == "Flop" && view.to_act == Some(hero()) {
+                let label = session.observation(hero()).map(|o| {
+                    terminal_poker::trainer::facts::Facts::calculate(&o).hand_classification
+                })?;
+                if label.to_ascii_lowercase().contains("pair")
+                    && label.to_ascii_lowercase().contains("queen")
+                {
+                    return Ok(session);
+                }
+                break;
+            }
+            if session.finished() {
+                break;
+            }
+            if view.to_act == Some(hero()) {
+                let observation = session.observation(hero())?;
+                session.submit(observation.check_call())?;
+                session.continue_hand();
+            } else {
+                session.step_bot()?;
             }
         }
     }
-    println!("TRAINER_TABLE_CAPTURES_PASS {output}");
-    Ok(())
+    Err("could not build deterministic three-seat flop pair-of-queens fixture".into())
 }
 
 fn hero_turn(seats: u8) -> Result<Session, String> {
@@ -141,6 +316,18 @@ fn capture(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let projection = session.view();
     let actions = session.recent_actions();
+    let feedback = session.coaching.as_ref().map(local_feedback);
+    let hand_label = session
+        .coaching
+        .as_ref()
+        .map(|d| present_hand_label(&d.facts.hand_classification))
+        .or_else(|| {
+            session.observation(hero()).ok().map(|o| {
+                present_hand_label(
+                    &terminal_poker::trainer::facts::Facts::calculate(&o).hand_classification,
+                )
+            })
+        });
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
     terminal.draw(|frame| {
         table_ui::render(
@@ -155,6 +342,11 @@ fn capture(
                 notice_title,
                 notice,
                 raise,
+                hand_label: hand_label.as_deref(),
+                review_tone: feedback
+                    .as_ref()
+                    .map(|feedback| table_ui::ReviewTone::from_assessment(&feedback.assessment)),
+                guidance_source: feedback.as_ref().map(|_| "Local guidance · heuristic"),
             },
         );
         if let Some((body, title)) = details {
