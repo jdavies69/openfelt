@@ -177,7 +177,7 @@ pub fn run(settings: Settings, store: Store) -> Result<(), Box<dyn std::error::E
             }
             continue;
         }
-        if code == KeyCode::Char('r') && ui.session.coaching.is_none() {
+        if code == KeyCode::Char('v') && ui.session.coaching.is_none() {
             match super::replay_ui::ReplayUi::open(&store) {
                 Ok(replay) => ui.replay = Some(replay),
                 Err(e) => ui.status = e,
@@ -551,7 +551,7 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
     let (title, body) = if ui.consent {
         (" ENABLE OPTIONAL CLOUD COACHING ",format!("Destination: https://api.openai.com/v1/responses\nModel: {} · credential: OPENAI_API_KEY\nOnly your pre-decision cards, public table/action data and teaching facts leave this device.\nProvider charges and data terms apply. Limit: {} requests / session.\nEnter enables paid coaching this session. Esc or L plays with local teaching.\nNo request is made until you accept a poker decision.",ui.session.settings.cloud.model,ui.session.settings.cloud.max_requests))
     } else if ui.help {
-        (" HOW TO PLAY ","F folds · C checks or calls · R opens bet/raise TO entry in chips.\nEnter submits an amount; arrows adjust by one chip. A asks for all-in confirmation.\nAfter every accepted decision the table pauses: Enter continues, ? expands teaching.\nBetween hands: B tops up/rebuys to 100BB; W withdraws chips; Enter deals.\nRun openfelt --drill <topic> for a short offline practice set.\nBots use reviewed heuristic ranges, style, and difficulty—not solver strategies.\nSettings and private learning history live in your local OpenFelt data folder.\nQ quits at any time. No timer acts for you.".into())
+        (" HOW TO PLAY ","F folds · C checks or calls · R opens bet/raise TO entry in chips.\nEnter submits an amount; arrows adjust by one chip. A asks for all-in confirmation.\nAfter every accepted decision the table pauses: Enter continues, ? expands teaching.\nV browses saved completed hands; B bookmarks a replay decision.\nBetween hands: B tops up/rebuys to 100BB; W withdraws chips; Enter deals.\nRun openfelt --drill <topic> for a short offline practice set.\nBots use reviewed heuristic ranges, style, and difficulty—not solver strategies.\nSettings and private learning history live in your local OpenFelt data folder.\nQ quits at any time. No timer acts for you.".into())
     } else if let Some(d) = &ui.session.coaching {
         let explanation = if ui.session.settings.coaching == CoachingMode::Off {
             "Coaching off. Your decision is accepted.".into()
