@@ -427,11 +427,12 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
                 Span::raw("   Play the hand. Learn the game."),
             ]),
             Line::from(format!(
-                "Local play money · {}/{} blinds · {} seats · Rake OFF · {:?} opponents",
+                "Local play money · {}/{} blinds · {} seats · Rake OFF · {:?}/{:?} opponents",
                 ui.session.settings.small_blind,
                 ui.session.settings.big_blind,
                 ui.session.settings.seats,
-                ui.session.settings.opponents.profile
+                ui.session.settings.opponents.style,
+                ui.session.settings.opponents.difficulty
             )),
         ]),
         regions[0],
@@ -514,7 +515,7 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
     let (title, body) = if ui.consent {
         (" ENABLE OPTIONAL CLOUD COACHING ",format!("Destination: https://api.openai.com/v1/responses\nModel: {} · credential: OPENAI_API_KEY\nOnly your pre-decision cards, public table/action data and teaching facts leave this device.\nProvider charges and data terms apply. Limit: {} requests / session.\nEnter enables paid coaching this session. Esc or L plays with local teaching.\nNo request is made until you accept a poker decision.",ui.session.settings.cloud.model,ui.session.settings.cloud.max_requests))
     } else if ui.help {
-        (" HOW TO PLAY ","F folds · C checks or calls · R opens bet/raise TO entry in chips.\nEnter submits an amount; arrows adjust by one chip. A asks for all-in confirmation.\nAfter every accepted decision the table pauses: Enter continues, ? expands teaching.\nBetween hands: B tops up/rebuys to 100BB; W withdraws chips; Enter deals.\nBots use heuristic starting ranges and style settings, not solver strategies.\nSettings and private learning history live in your local OpenFelt data folder.\nQ quits at any time. No timer acts for you.".into())
+        (" HOW TO PLAY ","F folds · C checks or calls · R opens bet/raise TO entry in chips.\nEnter submits an amount; arrows adjust by one chip. A asks for all-in confirmation.\nAfter every accepted decision the table pauses: Enter continues, ? expands teaching.\nBetween hands: B tops up/rebuys to 100BB; W withdraws chips; Enter deals.\nRun openfelt --drill <topic> for a short offline practice set.\nBots use reviewed heuristic ranges, style, and difficulty—not solver strategies.\nSettings and private learning history live in your local OpenFelt data folder.\nQ quits at any time. No timer acts for you.".into())
     } else if let Some(d) = &ui.session.coaching {
         let explanation = if ui.session.settings.coaching == CoachingMode::Off {
             "Coaching off. Your decision is accepted.".into()

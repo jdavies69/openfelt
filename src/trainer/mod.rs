@@ -1,4 +1,6 @@
 //! OpenFelt's local controller. Engine, policy and coaching have separate contracts.
+pub mod coaching;
+pub mod drills;
 pub mod facts;
 pub mod policy;
 pub mod provider;

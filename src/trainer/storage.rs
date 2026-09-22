@@ -70,6 +70,15 @@ pub struct Progress {
     pub decisions: u64,
     pub profit_chips: i64,
     pub concepts: BTreeMap<String, u64>,
+    /// Drill outcomes are distinct from passive concept exposure during hands.
+    pub drills: BTreeMap<String, DrillProgress>,
+}
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DrillProgress {
+    pub attempts: u64,
+    pub correct: u64,
+    pub completed_sets: u64,
 }
 pub struct Store {
     pub root: PathBuf,

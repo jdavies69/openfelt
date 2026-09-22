@@ -44,12 +44,19 @@ Blinds stay fixed and rake is off. Busted bots rebuy to preserve the selected se
 ```sh
 openfelt --seats 6 --small-blind 1 --big-blind 2 --opponents fundamentals
 openfelt --opponents recreational --aggression 0.6 --bluff-rate 0.08 --mistake-rate 0.15
+openfelt --opponent-style loose --opponent-difficulty practiced
 openfelt --coaching off
+openfelt --drill starting-hands
+openfelt --drill position
+openfelt --drill calling-prices
+openfelt --drill value-betting
 openfelt --save-settings
 openfelt --stats
 ```
 
-`fundamentals`, `recreational`, and `competent` are **heuristic profiles**, not independently rated skill levels or GTO opponents. Starting ranges include pairs, broadway and suited aces; recreational adds suited connectors. Profiles vary call-price thresholds; style probabilities are independent settings. Opponents receive only their own cards and public data with separate random generators.
+The four drill topics each draw three questions from a larger local set, explain every answer, accept listed defensible alternatives, and persist attempts and accepted answers separately from ordinary hand/concept exposure. A recommendation appears only after at least two completed sets supply evidence; these exercises teach reviewed categorical rules rather than universal strategy.
+
+`fundamentals`, `recreational`, and `competent` remain **heuristic profiles**, not independently rated skill levels or GTO opponents. `--opponent-style tight|balanced|loose` changes range width and bluff/call tendencies, while `--opponent-difficulty beginner|practiced` changes decision consistency independently. Ranges account for position and prior raises; postflop policy recognizes made hands and basic flush/open-ended draws and varies sizing. Opponents receive only their own cards and public data with separate random generators. Behavioral fixtures verify reproducibility and legal completion, but no claim of human-equivalent skill is made.
 
 ## Optional OpenAI coaching (BYOK)
 

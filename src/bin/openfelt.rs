@@ -1,6 +1,7 @@
 use clap::Parser;
 use terminal_poker::trainer::{
-    policy::Profile,
+    drills::{self, DrillTopic},
+    policy::{Difficulty, Profile, Style},
     storage::{CoachingMode, Store},
     tui,
 };
@@ -20,6 +21,12 @@ struct Args {
     big_blind: Option<u32>,
     #[arg(long, value_enum)]
     opponents: Option<Profile>,
+    /// Opponent personality, independent from decision consistency.
+    #[arg(long, value_enum)]
+    opponent_style: Option<Style>,
+    /// Opponent decision consistency; both levels remain heuristic.
+    #[arg(long, value_enum)]
+    opponent_difficulty: Option<Difficulty>,
     #[arg(long)]
     aggression: Option<f64>,
     #[arg(long)]
@@ -53,6 +60,9 @@ struct Args {
     /// Print private storage location and cumulative progress, without launching a table.
     #[arg(long)]
     stats: bool,
+    /// Run a three-question offline practice set and exit.
+    #[arg(long, value_enum)]
+    drill: Option<DrillTopic>,
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -60,6 +70,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(root) => Store { root },
         None => Store::default_location()?,
     };
+    if let Some(topic) = args.drill {
+        let mut progress = store.progress()?;
+        let seed = rand::random();
+        drills::run(
+            topic,
+            seed,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+            &mut progress,
+        )?;
+        store.save("progress.json", &progress)?;
+        if let Some(next) = drills::recommendation(&progress) {
+            println!("\nRecommended next practice: {next}");
+        }
+        return Ok(());
+    }
     if args.stats {
         let p = store.progress()?;
         println!(
@@ -69,6 +95,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             p.decisions,
             p.profit_chips
         );
+        for (topic, d) in &p.drills {
+            println!(
+                "{topic}: {}/{} accepted answers across {} sets",
+                d.correct, d.attempts, d.completed_sets
+            );
+        }
+        if let Some(next) = drills::recommendation(&p) {
+            println!("Recommended next practice: {next}");
+        }
         return Ok(());
     }
     let mut s = store.settings()?;
@@ -83,6 +118,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(v) = args.opponents {
         s.opponents.profile = v;
+    }
+    if let Some(v) = args.opponent_style {
+        s.opponents.style = v;
+    }
+    if let Some(v) = args.opponent_difficulty {
+        s.opponents.difficulty = v;
     }
     if let Some(v) = args.aggression {
         s.opponents.aggression = v;

@@ -182,22 +182,5 @@ pub struct Feedback {
     pub alternative_action: Option<String>,
 }
 pub fn local_feedback(d: &Decision) -> Feedback {
-    let (concept, explanation)=match d.accepted_action {
-        Action::Fold => ("Folding", "Folding gives up this pot and preserves your remaining chips. Judge the choice using what you knew now, not the cards that come later."),
-        Action::Check => ("Position", "Checking costs no additional chips and keeps you in the hand. Notice who still acts after you: later position gives you more information."),
-        Action::Call(_) => ("Calling", "Calling matches the wager without raising. Before calling, ask which worse hands can continue and how your hand can improve. A cheap call alone does not make it profitable."),
-        Action::Bet(_) | Action::Raise(_) => ("Value betting", "A value bet aims to get called by worse hands. Name a plausible worse hand before betting; a bluff instead aims to make better hands fold."),
-        Action::AllIn(_) => ("Stack commitment", "An all-in commits your remaining stack. You can win only the pots you are eligible for; chips above a matched contribution are returned. Winning this hand does not prove the choice was good."),
-    };
-    Feedback {
-        version: 1,
-        hand_id: d.observation.hand_id,
-        revision: d.observation.revision,
-        assessment: "uncertain".into(),
-        explanation: explanation.into(),
-        concept: concept.into(),
-        assumptions: vec!["Local teaching heuristic; no opponent range evaluated.".into()],
-        evidence_basis: "heuristic".into(),
-        alternative_action: None,
-    }
+    super::coaching::feedback(d)
 }

@@ -249,6 +249,117 @@ fn long_cash_sessions_conserve_chips_except_recorded_cash_flows() {
     }
 }
 #[test]
+fn every_style_and_difficulty_completes_legal_hands() {
+    for style in [
+        policy::Style::Tight,
+        policy::Style::Balanced,
+        policy::Style::Loose,
+    ] {
+        for difficulty in [policy::Difficulty::Beginner, policy::Difficulty::Practiced] {
+            let mut s = Session::new(Settings {
+                opponents: policy::PolicySettings {
+                    style,
+                    difficulty,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .unwrap();
+            for _ in 0..500 {
+                if s.finished() {
+                    break;
+                }
+                if s.view().to_act == Some(hero()) {
+                    let a = s.observation(hero()).unwrap().check_call();
+                    s.submit(a).unwrap();
+                    s.continue_hand();
+                } else {
+                    s.step_bot().unwrap();
+                }
+            }
+            assert!(s.finished(), "style {style:?} difficulty {difficulty:?}");
+            assert_eq!(s.hand.total_chips(), 1200);
+        }
+    }
+}
+#[test]
+fn opponent_choices_are_seed_reproducible_for_every_style_and_difficulty() {
+    let d = sample_decision();
+    for style in [
+        policy::Style::Tight,
+        policy::Style::Balanced,
+        policy::Style::Loose,
+    ] {
+        for difficulty in [policy::Difficulty::Beginner, policy::Difficulty::Practiced] {
+            let settings = policy::PolicySettings {
+                style,
+                difficulty,
+                ..Default::default()
+            };
+            let mut a = Opponent::new(0x0000_fe17, settings.clone());
+            let mut b = Opponent::new(0x0000_fe17, settings);
+            for _ in 0..24 {
+                assert_eq!(a.choose(&d.observation), b.choose(&d.observation));
+            }
+        }
+    }
+}
+#[test]
+fn style_and_difficulty_have_seeded_observable_behavior() {
+    let mut o = sample_decision().observation;
+    use crate::game::deck::{Card, Rank, Suit};
+    o.actor = o.button;
+    o.history.clear();
+    o.hole_cards = vec![
+        Card::new(Rank::Ace, Suit::Clubs),
+        Card::new(Rank::Eight, Suit::Diamonds),
+    ];
+    let own = o.seats.iter_mut().find(|s| s.seat == o.actor).unwrap();
+    own.street_contribution = 0;
+    o.wager = 2;
+    o.legal.can_check = false;
+    o.legal.can_fold = true;
+    o.legal.call_amount = Some(2);
+    let base = policy::PolicySettings {
+        aggression: 0.0,
+        bluff_rate: 0.0,
+        mistake_rate: 0.0,
+        difficulty: policy::Difficulty::Practiced,
+        ..Default::default()
+    };
+    let mut tight = Opponent::new(
+        9,
+        policy::PolicySettings {
+            style: policy::Style::Tight,
+            ..base.clone()
+        },
+    );
+    let mut loose = Opponent::new(
+        9,
+        policy::PolicySettings {
+            style: policy::Style::Loose,
+            ..base.clone()
+        },
+    );
+    assert_eq!(tight.choose(&o), Action::Fold);
+    assert_eq!(loose.choose(&o), Action::Call(2));
+    let mut beginner_continues = 0;
+    for seed in 0..128 {
+        let mut bot = Opponent::new(
+            seed,
+            policy::PolicySettings {
+                style: policy::Style::Tight,
+                difficulty: policy::Difficulty::Beginner,
+                ..base.clone()
+            },
+        );
+        if bot.choose(&o) != Action::Fold {
+            beginner_continues += 1;
+        }
+    }
+    assert!(beginner_continues > 0); // fixed seeds exercise the documented extra inconsistency
+}
+#[test]
 fn stored_settings_and_progress_roundtrip_without_secret_fields() {
     let root = std::env::temp_dir().join(format!("openfelt-storage-{}", rand::random::<u64>()));
     let store = storage::Store { root: root.clone() };
