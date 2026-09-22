@@ -16,7 +16,7 @@ cd openfelt
 cargo run --locked --release --bin openfelt
 ```
 
-Use a terminal at least **80 columns × 30 rows**; 100×36 gives more room. Tagged releases are built by GitHub Actions for Linux x86_64, Windows x86_64, macOS Apple Silicon, and macOS Intel. Treat a platform as verified only when its release and Quality workflows are green; native clean-install walkthroughs remain a manual release check.
+Use a terminal at least **80 columns × 30 rows**; 100×36 gives more room. Tagged releases are built by GitHub Actions for Linux x86_64, Windows x86_64, and macOS Apple Silicon. Intel macOS is deprecated and receives no release artifacts or CI coverage. Treat a supported platform as verified only when its release and Quality workflows are green; native clean-install walkthroughs remain a manual release check.
 
 To install the command from this checkout:
 

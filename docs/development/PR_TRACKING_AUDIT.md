@@ -1,9 +1,11 @@
 # PR tracking audit - 2026-09-09
 
-PR preparation authorized after this audit. Portable onboarding, four-platform CI,
+PR preparation authorized after this audit. Portable onboarding and the historical four-platform CI,
 ADR index updates and archive-reference labeling are now implemented. The audit
 observations below describe the pre-commit state; final commits follow the explicit
-file list. Native macOS CI results and real terminal/network smoke are distinct.
+file list. That historical matrix included Intel macOS, which is now deprecated;
+the supported matrix is Linux x86_64, Windows x86_64, and macOS Apple Silicon.
+Native macOS CI results and real terminal/network smoke are distinct.
 
 ## Decision
 

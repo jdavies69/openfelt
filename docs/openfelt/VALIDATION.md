@@ -41,4 +41,4 @@ The OpenAI adapter follows the current official Responses structured-output cont
 
 Upstream's unsafe aggregate pot-odds observation fields remain available for legacy training compatibility. OpenFelt coaching does not use them: its separate allowlisted facts layer calculates legal call cost and contestable pots and makes no universal equity/EV claim.
 
-The initial baseline and documentation-only branch passed the four-platform GitHub Quality matrix. Final implementation CI results should be read from the repository's corresponding commit/run; local results alone are not a claim of remote CI success.
+The initial baseline and documentation-only branch passed the historical four-platform GitHub Quality matrix, which included Intel macOS. Intel macOS is now deprecated; the supported matrix is Linux x86_64, Windows x86_64, and macOS Apple Silicon. Final implementation CI results should be read from the repository's corresponding commit/run; local results alone are not a claim of remote CI success.

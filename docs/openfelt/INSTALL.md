@@ -1,6 +1,6 @@
 # Install and upgrade OpenFelt
 
-Tagged releases produce archives, shell and PowerShell installers, and checksums from the tagged source through the repository's `release.yml` workflow. Supported build targets are Linux x86_64, Windows x86_64, macOS Apple Silicon, and macOS Intel.
+Tagged releases produce archives, shell and PowerShell installers, and checksums from the tagged source through the repository's `release.yml` workflow. Supported build targets are Linux x86_64, Windows x86_64, and macOS Apple Silicon. Intel macOS is deprecated and receives no release artifact.
 
 ## Install a release
 
