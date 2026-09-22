@@ -26,6 +26,8 @@ const MUTED: Color = Color::Rgb(145, 145, 145);
 const RULE: Color = Color::Rgb(64, 64, 64);
 const PANEL: Color = Color::Rgb(16, 16, 16);
 const CARD: Color = Color::Rgb(22, 22, 22);
+const CARD_FACE: Color = Color::Rgb(221, 220, 239);
+const CARD_INK: Color = Color::Rgb(27, 27, 31);
 const RED: Color = Color::Rgb(255, 74, 74);
 const RED_DARK: Color = Color::Rgb(111, 23, 23);
 const WINNER_GREEN: Color = Color::Rgb(57, 255, 20);
@@ -337,10 +339,12 @@ fn render_board(
     } else {
         5
     };
-    let row_width = shown_slots * 4;
+    // Four columns per card plus a single column of breathing room makes the
+    // board read as five physical cards instead of a run of bracketed text.
+    let row_width = shown_slots * 5 - 1;
     let start_x = felt.x + (felt.width.saturating_sub(row_width)) / 2;
     for index in 0..shown_slots {
-        let area = Rect::new(start_x + index * 4, center_y.saturating_sub(1), 4, 1);
+        let area = Rect::new(start_x + index * 5, center_y.saturating_sub(1), 4, 3);
         if let Some(card) = view.board.get(index as usize) {
             let plays = matches!(
                 showdown,
@@ -353,11 +357,7 @@ fn render_board(
                 .any(|hand| hand.best_five.contains(card));
             draw_card(frame, area, card, plays);
         } else {
-            frame.render_widget(
-                Paragraph::new(Span::styled("[░]", Style::default().fg(MUTED).bg(CARD)))
-                    .alignment(Alignment::Center),
-                area,
-            );
+            draw_empty_card(frame, area);
         }
     }
     let detail = showdown.map_or_else(
@@ -388,7 +388,7 @@ fn render_board(
         Paragraph::new(Span::styled(detail, Style::default().fg(TEXT)))
             .alignment(Alignment::Center)
             .style(Style::default().bg(FELT)),
-        Rect::new(felt.x + 1, center_y + 1, felt.width.saturating_sub(2), 1),
+        Rect::new(felt.x + 1, center_y + 2, felt.width.saturating_sub(2), 1),
     );
 }
 
@@ -597,9 +597,9 @@ fn render_local_seat(
     let width = (seat_width.saturating_mul(2)).clamp(18, 28).min(felt.width);
     let area = Rect::new(
         felt.x + (felt.width.saturating_sub(width)) / 2,
-        felt.y + felt.height.saturating_sub(4),
+        felt.y + felt.height.saturating_sub(5),
         width,
-        4,
+        5,
     );
     let local = view.seats.iter().find(|seat| seat.seat == view.local_seat);
     let mucked = view.mucked.contains(&view.local_seat);
@@ -661,30 +661,28 @@ fn render_local_seat(
             showdown,
             Some(ShowdownStage::Winners | ShowdownStage::Award)
         );
-    let mut card_spans = Vec::new();
-    for card in cards.iter().take(
-        if folded || mucked || local.is_none_or(|seat| !seat.cards_visible) {
-            0
-        } else {
-            2
-        },
-    ) {
-        if !card_spans.is_empty() {
-            card_spans.push(Span::raw(" "));
-        }
-        card_spans.extend(styled_brackets(
-            format!("[ {}{} ]", card.rank.symbol(), card.suit.symbol()),
-            Style::default()
-                .fg(if card.suit.is_red() { RED } else { TEXT })
-                .bg(CARD)
-                .add_modifier(Modifier::BOLD),
-            highlight_winner
-                && local
-                    .and_then(|seat| seat.showdown_hand.as_ref())
-                    .is_some_and(|hand| hand.best_five.contains(card)),
-        ));
-    }
-    if card_spans.is_empty() {
+    let visible_cards = if folded || mucked || local.is_none_or(|seat| !seat.cards_visible) {
+        &[][..]
+    } else {
+        cards.as_slice()
+    };
+    let title = if state_label.is_empty() {
+        format!(" {header} ")
+    } else {
+        // On the narrowest supported table, lead with privacy/showdown state
+        // so it cannot be clipped by the stack amount.
+        format!(" {state_label} · {header} ")
+    };
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if highlight_winner { RED } else { RULE }));
+    let inner = block.inner(area);
+    frame.render_widget(block.style(Style::default().bg(PANEL)), area);
+    if visible_cards.is_empty() {
         let holding = if folded {
             "FOLDED"
         } else if mucked {
@@ -694,39 +692,93 @@ fn render_local_seat(
         } else {
             "[░] [░]"
         };
-        card_spans.push(Span::styled(holding, Style::default().fg(MUTED).bg(CARD)));
+        frame.render_widget(
+            Paragraph::new(Span::styled(holding, Style::default().fg(MUTED).bg(CARD)))
+                .alignment(Alignment::Center),
+            inner,
+        );
+        return;
     }
+
+    let card_width = 6;
+    let row_width = visible_cards.len().min(2) as u16 * card_width + 1;
+    let start_x = inner.x + inner.width.saturating_sub(row_width) / 2;
+    for (index, card) in visible_cards.iter().take(2).enumerate() {
+        let highlighted = highlight_winner
+            && local
+                .and_then(|seat| seat.showdown_hand.as_ref())
+                .is_some_and(|hand| hand.best_five.contains(card));
+        draw_large_card(
+            frame,
+            Rect::new(
+                start_x + index as u16 * (card_width + 1),
+                inner.y,
+                card_width,
+                3,
+            ),
+            card,
+            highlighted,
+        );
+    }
+}
+
+fn draw_card(frame: &mut Frame<'_>, area: Rect, card: &Card, highlighted: bool) {
+    draw_large_card(frame, area, card, highlighted);
+}
+
+fn draw_large_card(frame: &mut Frame<'_>, area: Rect, card: &Card, highlighted: bool) {
+    let rank = if card.rank == crate::game::deck::Rank::Ten {
+        "T"
+    } else {
+        card.rank.symbol()
+    };
+    let ink = if card.suit.is_red() { RED } else { CARD_INK };
+    let face = Style::default()
+        .fg(ink)
+        .bg(CARD_FACE)
+        .add_modifier(Modifier::BOLD);
+    let edge = if highlighted { WINNER_GREEN } else { ink };
+    let width = area.width as usize;
+    if area.height < 3 || width < 4 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(compact_card(card), face)).alignment(Alignment::Center),
+            area,
+        );
+        return;
+    }
+    let middle_left = width.saturating_sub(1) / 2;
+    let middle = format!(
+        "{}{}{}",
+        " ".repeat(middle_left),
+        card.suit.symbol(),
+        " ".repeat(width.saturating_sub(middle_left + 1))
+    );
+    let edge_style = face.fg(edge);
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(
-                header,
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(card_spans),
-        ])
-        .alignment(Alignment::Center)
-        .style(Style::default().bg(PANEL))
-        .block(
-            Block::default()
-                .title(Span::styled(state_label, Style::default().fg(MUTED)))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(if highlight_winner { RED } else { RULE })),
-        ),
+            Line::from(vec![
+                Span::styled(rank.to_string(), edge_style),
+                Span::styled(" ".repeat(width.saturating_sub(1)), face),
+            ]),
+            Line::from(Span::styled(middle, face)),
+            Line::from(vec![
+                Span::styled(" ".repeat(width.saturating_sub(1)), face),
+                Span::styled(rank.to_string(), edge_style),
+            ]),
+        ]),
         area,
     );
 }
 
-fn draw_card(frame: &mut Frame<'_>, area: Rect, card: &Card, highlighted: bool) {
+fn draw_empty_card(frame: &mut Frame<'_>, area: Rect) {
+    let style = Style::default().fg(RULE).bg(CARD);
+    let width = area.width as usize;
     frame.render_widget(
-        Paragraph::new(Line::from(styled_brackets(
-            compact_card(card),
-            Style::default()
-                .fg(if card.suit.is_red() { RED } else { TEXT })
-                .bg(CARD)
-                .add_modifier(Modifier::BOLD),
-            highlighted,
-        )))
-        .alignment(Alignment::Center),
+        Paragraph::new(vec![
+            Line::from(Span::styled("·".repeat(width), style)),
+            Line::from(Span::styled(" ".repeat(width), style)),
+            Line::from(Span::styled("·".repeat(width), style)),
+        ]),
         area,
     );
 }
@@ -1254,11 +1306,17 @@ mod tests {
             terminal
                 .draw(|frame| render_with_raise(frame, &view, 0, Some((Some(1), 34))))
                 .unwrap();
-            let text = buffer_text(terminal.backend().buffer());
+            let buffer = terminal.backend().buffer();
+            let text = buffer_text(buffer);
 
-            assert!(
-                text.contains(" ] [ "),
-                "holdings overlap at {width}x{height}"
+            assert_eq!(
+                buffer
+                    .content
+                    .iter()
+                    .filter(|cell| cell.bg == CARD_FACE)
+                    .count(),
+                36,
+                "two 6x3 hero cards must remain fully visible at {width}x{height}"
             );
             assert!(
                 text.contains("1.5P"),
@@ -1312,8 +1370,9 @@ mod tests {
                 .draw(|frame| render_with_state(frame, &view, 0, None, None))
                 .unwrap();
             let text = buffer_text(terminal.backend().buffer());
-            // Four opponent holdings plus two pairs among the five board placeholders.
-            assert_eq!(text.matches("[░] [░]").count(), 6, "{width}x{height}");
+            // Four live opponent holdings remain facedown. Empty board slots now
+            // use card-shaped charcoal tiles rather than the same holding token.
+            assert_eq!(text.matches("[░] [░]").count(), 4, "{width}x{height}");
             assert_eq!(text.matches("FOLDED").count(), 2, "{width}x{height}");
             assert!(text.contains("WAITING"));
             assert!(text.contains("S8 OPEN"));
@@ -1325,11 +1384,18 @@ mod tests {
             .draw(|frame| render_with_state(frame, &view, 0, None, None))
             .unwrap();
         let text = buffer_text(terminal.backend().buffer());
-        assert_eq!(text.matches("[░] [░]").count(), 6);
+        assert_eq!(text.matches("[░] [░]").count(), 4);
         assert!(text.contains("FOLDED"));
-        assert!(
-            !text.contains(" ] [ "),
-            "folded hero must not look dealt in"
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .filter(|cell| cell.bg == CARD_FACE)
+                .count(),
+            0,
+            "folded hero must not retain visible card faces"
         );
     }
 
