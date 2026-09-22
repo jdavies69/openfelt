@@ -2,7 +2,7 @@ use clap::Parser;
 use std::{fs, path::PathBuf};
 use terminal_poker::trainer::{
     evaluation::{offline_report, scenario_decision},
-    provider::{self, Credential, ProviderSettings, Usage},
+    provider::{self, Credential, Provider, ProviderSettings, Usage},
 };
 
 #[derive(Parser)]
@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         };
         settings.validate()?;
-        let _ = Credential::from_environment()?;
+        let _ = Credential::from_environment(Provider::Openai)?;
         let mut usage = Usage::default();
         let mut report = offline_report()?;
         report.mode = "live_unreviewed".into();
@@ -90,6 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let started = std::time::Instant::now();
             let pending = provider::start(
                 decision,
+                Provider::Openai,
                 settings.clone(),
                 Credential::new(std::env::var("OPENAI_API_KEY")?)?,
                 &mut usage,
