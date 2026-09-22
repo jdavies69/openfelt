@@ -188,7 +188,7 @@ fn postflop_feedback(d: &Decision) -> Feedback {
     let o = &d.observation;
     let action = action_kind(&d.accepted_action);
     let (concept, explanation)=match action {
-        "check" => ("Postflop: free continuation", format!("Checking adds no chips. Your shown hand is {}. Reassess after later players act; this rule does not estimate equity.",d.facts.hand_classification)),
+        "check" => ("Postflop: free continuation", format!("Checking adds no chips. Your shown hand is {}. Reassess after later players act; this rule does not estimate the chance of winning.",d.facts.hand_classification)),
         "call" => ("Postflop calling price",format!("The legal call price and contestable pot are exact engine facts shown below, but whether {} is strong enough depends on unknown ranges and future action.",d.facts.hand_classification)),
         "raise" => ("Postflop: betting purpose",format!("With {}, name the purpose: value expects worse hands to continue; a bluff expects better hands to fold. This heuristic cannot prove either without opponent ranges.",d.facts.hand_classification)),
         "all-in" => ("Postflop: stack commitment",format!("All-in commits the remaining stack with {}. Eligible side pots are exact engine facts; strategic quality remains uncertain without ranges.",d.facts.hand_classification)),
