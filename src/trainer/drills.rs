@@ -2,7 +2,10 @@
 use super::storage::{DrillProgress, Progress};
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, Write};
+use std::{
+    collections::BTreeMap,
+    io::{BufRead, Write},
+};
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, clap::ValueEnum,
@@ -98,7 +101,66 @@ pub fn record(progress: &mut Progress, topic: DrillTopic, answers: &[bool]) {
     p.completed_sets += 1;
 }
 pub fn recommendation(progress: &Progress) -> Option<String> {
-    progress.drills.iter().filter(|(_,p)|p.attempts>=6).min_by_key(|(_,p)|p.correct*100/p.attempts.max(1)).and_then(|(topic,p)| { let pct=p.correct*100/p.attempts.max(1); (pct<75).then(||format!("Practice {topic}: {}/{} reviewed answers were accepted across {} completed sets.",p.correct,p.attempts,p.completed_sets)) })
+    recommendation_with(progress, &BTreeMap::new())
+}
+
+/// Practice advice backed by repeated local reconsiderations, explicit bookmarks, or drill scores.
+/// One uncertain decision is not treated as a weakness.
+pub fn recommendation_with(
+    progress: &Progress,
+    bookmarks: &BTreeMap<String, u64>,
+) -> Option<String> {
+    let pattern = progress
+        .review_patterns
+        .iter()
+        .filter(|(concept, pattern)| pattern.reconsider >= 3 && drill_for(concept).is_some())
+        .max_by_key(|(_, pattern)| (pattern.reconsider, pattern.seen));
+    if let Some((concept, pattern)) = pattern {
+        let (slug, title) = drill_for(concept)?;
+        return Some(format!(
+            "Practice {title}: {} reconsider assessments across {} decisions about {concept}. This is a repeated local heuristic pattern, not a solver grade. Run openfelt --drill {slug}.",
+            pattern.reconsider, pattern.seen
+        ));
+    }
+    let bookmark = bookmarks
+        .iter()
+        .filter(|(concept, count)| **count >= 1 && drill_for(concept).is_some())
+        .max_by_key(|(_, count)| *count);
+    if let Some((concept, count)) = bookmark {
+        let (slug, title) = drill_for(concept)?;
+        let spots = if *count == 1 { "decision" } else { "decisions" };
+        return Some(format!(
+            "Practice {title}: you bookmarked {count} {spots} about {concept}. Run openfelt --drill {slug}."
+        ));
+    }
+    progress
+        .drills
+        .iter()
+        .filter(|(_, p)| p.attempts >= 6)
+        .min_by_key(|(_, p)| p.correct * 100 / p.attempts.max(1))
+        .and_then(|(topic, p)| {
+            let pct = p.correct * 100 / p.attempts.max(1);
+            (pct < 75).then(|| {
+                format!(
+                    "Practice {topic}: {}/{} reviewed answers were accepted across {} completed sets.",
+                    p.correct, p.attempts, p.completed_sets
+                )
+            })
+        })
+}
+
+fn drill_for(concept: &str) -> Option<(&'static str, &'static str)> {
+    match concept {
+        "Preflop position-aware opening" | "Preflop after limpers" => {
+            Some(("position", "position"))
+        }
+        "Preflop facing a raise" => Some(("starting-hands", "starting hands")),
+        "Postflop calling price" => Some(("calling-prices", "calling prices")),
+        "Postflop: betting purpose" | "Postflop: value betting" => {
+            Some(("value-betting", "value betting"))
+        }
+        _ => None,
+    }
 }
 
 pub fn run<R: BufRead, W: Write>(
@@ -169,6 +231,7 @@ fn _keeps_type_documented(_: DrillProgress) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     #[test]
     fn every_topic_has_variants_and_only_declared_answers_score() {
         for topic in [
@@ -231,5 +294,37 @@ mod tests {
         )
         .is_err());
         assert!(p.drills.is_empty());
+    }
+    #[test]
+    fn repeated_reconsiderations_and_bookmarks_recommend_with_evidence() {
+        let mut p = Progress::default();
+        p.note_review("Preflop facing a raise", "uncertain");
+        p.note_review("Preflop facing a raise", "reconsider");
+        assert!(recommendation(&p).is_none());
+        p.note_review("Postflop: folding", "reconsider");
+        p.note_review("Postflop: folding", "reconsider");
+        p.note_review("Postflop: folding", "reconsider");
+        assert!(
+            recommendation(&p).is_none(),
+            "uncertain postflop concepts are not graded"
+        );
+        p.note_review("Preflop facing a raise", "reconsider");
+        p.note_review("Preflop facing a raise", "reasonable");
+        assert!(
+            recommendation(&p).is_none(),
+            "two reconsiderations are not enough"
+        );
+        p.note_review("Preflop facing a raise", "reconsider");
+        let text = recommendation(&p).unwrap();
+        assert!(text.contains("3 reconsider assessments"));
+        assert!(text.contains("starting hands"));
+        assert!(text.contains("openfelt --drill starting-hands"));
+        assert!(!text.contains("solver grade is"));
+        let mut bookmarks = BTreeMap::new();
+        bookmarks.insert("Postflop calling price".into(), 1);
+        let marked = recommendation_with(&Progress::default(), &bookmarks).unwrap();
+        assert!(marked.contains("bookmarked 1 decision"));
+        assert!(marked.contains("calling prices"));
+        assert!(!marked.to_ascii_lowercase().contains("weakness"));
     }
 }

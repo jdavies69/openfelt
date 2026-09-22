@@ -1,7 +1,15 @@
 //! Deterministic teaching rules built only from a frozen pre-decision observation.
 //! These are reviewed heuristics, not equity, EV, or solver output.
 use super::facts::{Decision, Feedback, Observation};
-use crate::game::{actions::Action, deck::Rank, multiway::MultiwayPhase, table::HandParticipation};
+use crate::bot::draws::detect_draws;
+use crate::game::{
+    actions::Action,
+    deck::{Card, Rank},
+    hand::{evaluate_hand, HandRank},
+    multiway::MultiwayPhase,
+    table::HandParticipation,
+};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TablePosition {
@@ -186,25 +194,177 @@ pub fn feedback(d: &Decision) -> Feedback {
 
 fn postflop_feedback(d: &Decision) -> Feedback {
     let o = &d.observation;
+    let rank = evaluate_hand(&o.hole_cards, &o.board).rank;
+    let draws = detect_draws(&o.hole_cards, &o.board);
+    let made = made_label(rank);
+    let draw = draw_label(draws.flush_draw, draws.oesd, draws.gutshot);
+    let texture = board_texture(&o.board);
+    let place = if matches!(table_position(o), TablePosition::Late) {
+        "later position"
+    } else {
+        "with players still to act"
+    };
+    let price = price_description(d);
+    let strong = rank >= HandRank::TwoPair;
+    let paired = rank >= HandRank::Pair;
+    let live_draw = draws.flush_draw || draws.oesd;
     let action = action_kind(&d.accepted_action);
-    let (concept, explanation)=match action {
-        "check" => ("Postflop: free continuation", format!("Checking adds no chips. Your shown hand is {}. Reassess after later players act; this rule does not estimate the chance of winning.",d.facts.hand_classification)),
-        "call" => ("Postflop calling price",format!("The legal call price and contestable pot are exact engine facts shown below, but whether {} is strong enough depends on unknown ranges and future action.",d.facts.hand_classification)),
-        "raise" => ("Postflop: betting purpose",format!("With {}, name the purpose: value expects worse hands to continue; a bluff expects better hands to fold. This heuristic cannot prove either without opponent ranges.",d.facts.hand_classification)),
-        "all-in" => ("Postflop: stack commitment",format!("All-in commits the remaining stack with {}. Eligible side pots are exact engine facts; strategic quality remains uncertain without ranges.",d.facts.hand_classification)),
-        _ => ("Postflop: folding",format!("Folding preserves the remaining stack but gives up this pot with {}. Future cards are deliberately excluded from this review.",d.facts.hand_classification)),
+    let (assessment, concept, explanation, alternative) = match action {
+        "raise" | "all-in" if strong => (
+            "reasonable",
+            "Postflop: value betting",
+            format!(
+                "Betting {made} can ask worse hands to continue for value. {texture} You are {place}. Unknown ranges can still change whether this is the size or the line to choose."
+            ),
+            Some("check_call".into()),
+        ),
+        "raise" | "all-in" if !paired && !live_draw => (
+            "reconsider",
+            "Postflop: betting purpose",
+            format!(
+                "Betting {made} with {draw} needs a better hand that can fold. This heuristic cannot see that target. {texture}"
+            ),
+            Some("check_call".into()),
+        ),
+        "raise" | "all-in" => (
+            "uncertain",
+            "Postflop: betting purpose",
+            format!(
+                "A bet with {made} and {draw} can be value, a bluff, or both. {price} {texture} Name the hands that continue or fold before treating one purpose as established."
+            ),
+            Some("check_call".into()),
+        ),
+        "call" if strong => (
+            "reasonable",
+            "Postflop calling price",
+            format!(
+                "Calling with {made} continues with a strong shown hand and {price}. A raise is a separate value plan, not required by this rule."
+            ),
+            alt_raise(o),
+        ),
+        "call" if !paired && !live_draw && d.facts.call_cost > 0 => (
+            "reconsider",
+            "Postflop calling price",
+            format!(
+                "Calling with {made} and {draw} pays {price}. {texture} Continuing needs a reason this heuristic does not have."
+            ),
+            alt_fold(o),
+        ),
+        "call" => (
+            "uncertain",
+            "Postflop calling price",
+            format!(
+                "The call uses {price} with {made} and {draw}. {texture} Whether that price is attractive depends on ranges and future action, which this rule does not score."
+            ),
+            alt_fold(o).or_else(|| alt_raise(o)),
+        ),
+        "check" if strong => (
+            "uncertain",
+            "Postflop: value betting",
+            format!(
+                "Checking {made} can trap or miss a value bet. Both can be defensible {place}. {texture}"
+            ),
+            alt_raise(o),
+        ),
+        "check" => (
+            "reasonable",
+            "Postflop: free continuation",
+            format!(
+                "Checking adds no chips with {made} and {draw}. {texture} Reassess after later players act."
+            ),
+            alt_raise(o),
+        ),
+        _ if strong => (
+            "reconsider",
+            "Postflop: folding",
+            format!(
+                "Folding {made} gives up this pot. A continue was available. {texture} Future cards stay out of this review."
+            ),
+            Some("check_call".into()),
+        ),
+        _ if d.facts.call_cost > 0 && !paired && !live_draw => (
+            "reasonable",
+            "Postflop: folding",
+            format!(
+                "Folding {made} with {draw} avoids {price}. {texture} Future cards stay out of this review."
+            ),
+            Some("check_call".into()),
+        ),
+        _ => (
+            "uncertain",
+            "Postflop: folding",
+            format!(
+                "Folding preserves the remaining stack with {made} and {draw}. {texture} This rule does not prove the fold is required."
+            ),
+            Some("check_call".into()),
+        ),
     };
     Feedback {
         version: 1,
         hand_id: o.hand_id,
         revision: o.revision,
-        assessment: "uncertain".into(),
+        assessment: assessment.into(),
         explanation,
         concept: concept.into(),
-        assumptions: vec!["No opponent range or future card evaluated.".into()],
+        assumptions: vec![
+            "Made-hand category and draw labels use only your cards and the current board.".into(),
+            "No opponent range, future card, or numeric chance of winning is evaluated.".into(),
+        ],
         evidence_basis: "heuristic".into(),
-        alternative_action: None,
+        alternative_action: alternative,
     }
+}
+
+fn made_label(rank: HandRank) -> &'static str {
+    match rank {
+        HandRank::HighCard => "a high-card hand",
+        HandRank::Pair => "one pair",
+        HandRank::TwoPair => "two pair",
+        HandRank::ThreeOfAKind => "three of a kind",
+        HandRank::Straight => "a straight",
+        HandRank::Flush => "a flush",
+        HandRank::FullHouse => "a full house",
+        HandRank::FourOfAKind => "four of a kind",
+        HandRank::StraightFlush => "a straight flush",
+    }
+}
+
+fn draw_label(flush: bool, open_ended: bool, gutshot: bool) -> &'static str {
+    match (flush, open_ended, gutshot) {
+        (true, true, _) | (true, _, true) => "a flush draw and a straight draw",
+        (true, false, false) => "a flush draw",
+        (false, true, _) => "an open-ended straight draw",
+        (false, false, true) => "a gutshot straight draw",
+        (false, false, false) => "no flush or open-ended straight draw",
+    }
+}
+
+fn board_texture(board: &[Card]) -> &'static str {
+    if board.len() < 3 {
+        return "The board is not complete.";
+    }
+    let mut ranks = BTreeMap::new();
+    let mut suits = BTreeMap::new();
+    for card in board {
+        *ranks.entry(card.rank).or_insert(0u8) += 1;
+        *suits.entry(card.suit.symbol()).or_insert(0u8) += 1;
+    }
+    let paired = ranks.values().any(|count| *count >= 2);
+    let suited = suits.values().any(|count| *count >= 3);
+    match (paired, suited) {
+        (true, true) => "The public board is paired and has several cards of one suit.",
+        (true, false) => "The public board is paired.",
+        (false, true) => "The public board has several cards of one suit.",
+        (false, false) => "The public board is unpaired.",
+    }
+}
+
+fn alt_fold(o: &Observation) -> Option<String> {
+    o.legal.can_fold.then(|| "fold".into())
+}
+
+fn alt_raise(o: &Observation) -> Option<String> {
+    (o.legal.min_raise_to.is_some() || o.legal.min_bet_to.is_some()).then(|| "raise".into())
 }
 
 #[cfg(test)]
@@ -212,7 +372,7 @@ mod tests {
     use super::*;
     use crate::{
         game::{
-            deck::{Card, Suit},
+            deck::{Card, Rank, Suit},
             seat::SeatId,
         },
         trainer::{hero, storage::Settings, Session},
@@ -274,5 +434,62 @@ mod tests {
         assert_eq!(feedback(&d).concept, "Preflop facing a raise");
         d.observation.history = vec![(SeatId::new(4).unwrap(), Action::Call(2))];
         assert_eq!(feedback(&d).concept, "Preflop after limpers");
+    }
+    #[test]
+    fn postflop_guidance_uses_made_hand_draw_and_price_without_invented_numbers() {
+        use crate::trainer::provider::validate_feedback;
+        let mut d = decision();
+        d.observation.phase = MultiwayPhase::Flop;
+        d.observation.history.clear();
+        d.observation.board = vec![
+            Card::new(Rank::Ace, Suit::Clubs),
+            Card::new(Rank::King, Suit::Diamonds),
+            Card::new(Rank::Two, Suit::Hearts),
+        ];
+        d.observation.hole_cards = vec![
+            Card::new(Rank::Ace, Suit::Spades),
+            Card::new(Rank::Ace, Suit::Diamonds),
+        ];
+        d.observation.legal.can_check = true;
+        d.observation.legal.can_fold = false;
+        d.observation.legal.call_amount = None;
+        d.observation.legal.min_bet_to = Some(2);
+        d.accepted_action = Action::Bet(6);
+        d.facts = super::super::facts::Facts::calculate(&d.observation);
+        let value = feedback(&d);
+        assert_eq!(value.assessment, "reasonable");
+        assert_eq!(value.concept, "Postflop: value betting");
+        assert!(value.explanation.contains("three of a kind"));
+        validate_feedback(&value, &d).unwrap();
+
+        d.observation.board = vec![
+            Card::new(Rank::King, Suit::Diamonds),
+            Card::new(Rank::Queen, Suit::Hearts),
+            Card::new(Rank::Three, Suit::Clubs),
+        ];
+        d.observation.hole_cards = vec![
+            Card::new(Rank::Seven, Suit::Clubs),
+            Card::new(Rank::Two, Suit::Diamonds),
+        ];
+        d.facts = super::super::facts::Facts::calculate(&d.observation);
+        let air = feedback(&d);
+        assert_eq!(air.assessment, "reconsider");
+        assert_ne!(air.explanation, value.explanation);
+        assert!(air.explanation.contains("high-card"));
+        validate_feedback(&air, &d).unwrap();
+
+        d.observation.legal.can_check = false;
+        d.observation.legal.can_fold = true;
+        d.observation.legal.call_amount = Some(20);
+        d.observation.legal.min_bet_to = None;
+        d.accepted_action = Action::Fold;
+        d.facts = super::super::facts::Facts::calculate(&d.observation);
+        let folded = feedback(&d);
+        assert_eq!(folded.assessment, "reasonable");
+        assert!(folded.explanation.contains("no flush"));
+        for text in [&value.explanation, &air.explanation, &folded.explanation] {
+            assert!(!text.chars().any(|c| c.is_ascii_digit()));
+            assert!(!text.to_lowercase().contains("equity"));
+        }
     }
 }

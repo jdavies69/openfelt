@@ -94,8 +94,13 @@ fn evaluation_cli_defaults_offline_and_live_guard_makes_no_call() {
     let live = Command::new(exe)
         .arg("--live")
         .env_remove("OPENAI_API_KEY")
+        .env_remove("ANTHROPIC_API_KEY")
         .output()
         .unwrap();
     assert!(!live.status.success());
-    assert!(String::from_utf8_lossy(&live.stderr).contains("requires OPENAI_API_KEY"));
+    let err = String::from_utf8_lossy(&live.stderr);
+    assert!(
+        err.contains("OPENAI_API_KEY") || err.contains("ANTHROPIC_API_KEY"),
+        "{err}"
+    );
 }

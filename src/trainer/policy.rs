@@ -177,6 +177,15 @@ fn preflop_range(
     enters && (!raised || base || style == Style::Loose && late)
 }
 
+/// Documents what the reviewed fixtures do and do not claim.
+pub fn behavior_limitations() -> &'static [&'static str] {
+    &[
+        "Opening ranges change with position, prior raises, and style. They are hand-authored heuristics, not solver charts, and they have not been calibrated against recorded human play.",
+        "Difficulty changes how often a reviewed rule is ignored. Style changes range width and bluff tendency. Neither label is a measured skill rating.",
+        "Postflop continuation looks for a pair or a four-card flush or straight draw using that opponent's own cards and the public board. Hidden cards and future deck order are not inputs.",
+    ]
+}
+
 fn has_flush_or_open_ended_draw(o: &Observation) -> bool {
     use std::collections::BTreeMap;
     let cards = o.hole_cards.iter().chain(o.board.iter());
@@ -234,5 +243,48 @@ mod tests {
             };
             assert_eq!(s.style, Style::Loose);
         }
+        assert!(behavior_limitations().iter().all(|note| note.len() > 40));
+        assert!(behavior_limitations()
+            .iter()
+            .any(|note| note.contains("not been calibrated")));
+    }
+    #[test]
+    fn late_suited_connector_enters_for_loose_but_not_tight() {
+        // Eight-seven suited is a late suited connector: not base_range, not loose_extra
+        // from an ace/broadway, but late && suited_connector clears Balanced/Loose.
+        assert!(!preflop_range(
+            false,
+            false,
+            true,
+            true,
+            false,
+            Style::Tight
+        ));
+        assert!(preflop_range(
+            false,
+            false,
+            true,
+            true,
+            false,
+            Style::Balanced
+        ));
+        assert!(preflop_range(false, false, true, true, false, Style::Loose));
+        assert!(!preflop_range(
+            false,
+            false,
+            true,
+            false,
+            false,
+            Style::Loose
+        ));
+        assert!(!preflop_range(
+            false,
+            false,
+            true,
+            true,
+            true,
+            Style::Balanced
+        ));
+        assert!(preflop_range(false, false, true, true, true, Style::Loose));
     }
 }

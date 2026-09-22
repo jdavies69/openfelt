@@ -2,6 +2,7 @@ use clap::Parser;
 use terminal_poker::trainer::{
     drills::{self, DrillTopic},
     policy::{Difficulty, Profile, Style},
+    replay,
     storage::{CoachingMode, Store},
     tui,
 };
@@ -100,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &mut progress,
         )?;
         store.save("progress.json", &progress)?;
-        if let Some(next) = drills::recommendation(&progress) {
+        if let Some(next) = practice_recommendation(&store, &progress) {
             println!("\nRecommended next practice: {next}");
         }
         return Ok(());
@@ -120,7 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 d.correct, d.attempts, d.completed_sets
             );
         }
-        if let Some(next) = drills::recommendation(&p) {
+        if let Some(next) = practice_recommendation(&store, &p) {
             println!("Recommended next practice: {next}");
         }
         return Ok(());
@@ -192,4 +193,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         previous(info);
     }));
     tui::run(s, store, first_run)
+}
+
+fn practice_recommendation(
+    store: &Store,
+    progress: &terminal_poker::trainer::storage::Progress,
+) -> Option<String> {
+    let bookmarks = replay::Archive::load(&store.root)
+        .map(|archive| archive.bookmarked_concepts())
+        .unwrap_or_default();
+    drills::recommendation_with(progress, &bookmarks)
 }
