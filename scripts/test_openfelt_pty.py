@@ -26,6 +26,7 @@ class Game:
         self.resize(80, 30)
         env = dict(os.environ)
         env.pop("OPENAI_API_KEY", None)
+        env.pop("ANTHROPIC_API_KEY", None)
         env["TERM"] = "xterm-256color"
 
         def terminal_session():
@@ -139,13 +140,15 @@ with tempfile.TemporaryDirectory(prefix="openfelt-pty-") as root:
     g.quit()
     print("PASS: settings opens and safely returns to the live table")
 
-    g = Game(Path(root) / "missing-key", "--coaching", "openai", "--model", "fixture-model")
+    # A temporary data directory does not isolate the OS credential store.
+    # Decline cloud access here; mocked Rust tests cover missing credentials.
+    g = Game(Path(root) / "cloud-declined", "--coaching", "openai", "--model", "fixture-model")
     assert b"ENABLE OPTIONAL CLOUD COACHING" in ANSI.sub(b"", g.output)
-    g.send("\rC")
+    g.send("\x1b")
+    g.send("C")
     assert len(g.decisions()) == 1
-    assert b"OPENAI_API_KEY" in ANSI.sub(b"", g.output)
     g.send("\r")
     g.quit()
-    print("PASS: explicit cloud consent, missing key permits play, no paid requests")
+    print("PASS: declining cloud consent permits local play without credential access")
 
 print("All OpenFelt PTY smoke tests passed.")

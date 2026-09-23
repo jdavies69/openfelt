@@ -2,7 +2,7 @@
 
 > Play the hand. Learn the game.
 
-A public, MIT-licensed, local play-money No-Limit Texas Hold’em trainer. Start with six seats, 100 big blinds, heuristic opponents and short teaching after each decision. No account, subscription, API key or hosted service is required to play.
+A public, open-source, local play-money No-Limit Texas Hold’em trainer. Start with six seats, 100 big blinds, heuristic opponents and short teaching after each decision. No account, subscription, API key or hosted service is required to play. The combined application includes an AGPL-3.0-or-later solver; see [licensing and source](THIRD_PARTY_NOTICES.md).
 
 ## Run locally
 
@@ -117,6 +117,17 @@ Completed hands can be browsed after a restart with `openfelt-replay list`, then
 
 Run `openfelt-eval` for the committed, reproducible offline coaching corpus and rubric report. It makes no provider calls. `--live` requires an API key plus explicit model, request count, and budget, but live adapter execution remains disabled until reviewed scenario decisions and dated price inputs are supplied. Offline fixture success does not establish live teaching quality.
 
+## Local solver practice
+
+Run `openfelt --solver-practice`, or press **G** at the trainer table, for a
+heads-up river exercise with explicit hand ranges and betting options. Choose an
+action to see estimated EV loss and strategy frequency immediately after the
+local solve completes. No model or API key is involved. Custom weighted ranges
+and sizes can be supplied with `--solver-scenario path/to/scenario.json`.
+
+See [river practice and scenario format](docs/solver/README.md). This is a separate
+bounded training mode; regular multiway play still uses heuristic coaching.
+
 ## Development and provenance
 
 ```sh
@@ -126,7 +137,9 @@ cargo test --locked --all-targets --all-features
 cargo build --locked --release --bin openfelt --bin sneakyblinders --bin poker-server
 ```
 
-On macOS/Linux, also run `python3 scripts/test_openfelt_pty.py target/release/openfelt` for real terminal input/resize/restart checks.
+On macOS/Linux, also run `python3 scripts/test_openfelt_pty.py target/release/openfelt`
+and `python3 scripts/test_solver_pty.py target/release/openfelt` for real terminal
+input, resize, restart and solver-practice checks.
 
 No model key is needed for tests. Provider tests run artificial localhost servers; some environments need localhost permission. New trainer code lives under `src/trainer/`; the engine and original binary targets remain available. Package registry publication is disabled until OpenFelt distribution metadata is deliberately prepared. Do not reuse inherited release tags/workflows without reviewing their upstream-specific distribution settings.
 

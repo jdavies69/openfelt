@@ -124,6 +124,7 @@ struct Ui {
     cash_saved: usize,
     replay_saved: usize,
     replay: Option<super::replay_ui::ReplayUi>,
+    solver: Option<super::solver_ui::SolverUi>,
     saved_progress: Vec<u8>,
     settings: Option<SettingsEditor>,
     credential_test: Option<CredentialTest>,
@@ -145,7 +146,7 @@ pub fn run(
         input: Input::Play,
         feedback: None,
         pending: None,
-        status: "F fold · C check/call · R raise · A all-in · ? help".into(),
+        status: "F fold · C check/call · R raise · A all-in · G river practice · ? help".into(),
         deep: false,
         deep_scroll: 0,
         help: false,
@@ -159,6 +160,7 @@ pub fn run(
         cash_saved: 0,
         replay_saved: 0,
         replay: None,
+        solver: None,
         saved_progress: Vec::new(),
         settings: first_run.then(|| settings_editor(ui_settings_placeholder())),
         credential_test: None,
@@ -180,6 +182,9 @@ pub fn run(
     let mut redraw = true;
     let mut last_size = None;
     loop {
+        if let Some(solver) = &mut ui.solver {
+            redraw |= solver.tick();
+        }
         if let Some(result) = ui.credential_test.as_ref().and_then(CredentialTest::poll) {
             ui.credential_test = None;
             ui.status = match result {
@@ -249,6 +254,7 @@ pub fn run(
             && !ui.help
             && ui.settings.is_none()
             && ui.replay.is_none()
+            && ui.solver.is_none()
             && size.width >= 80
             && size.height >= 30
             && Instant::now() >= next_bot
@@ -280,6 +286,14 @@ pub fn run(
         redraw = true;
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             break;
+        }
+        if let Some(solver) = &mut ui.solver {
+            if solver.key(key.code) {
+                ui.solver = None;
+                ui.status = "Returned to table".into();
+                next_bot = Instant::now() + Duration::from_millis(450);
+            }
+            continue;
         }
         if size.width < 80 || size.height < 30 {
             continue;
@@ -567,6 +581,13 @@ pub fn run(
         if ui.help {
             if matches!(code, KeyCode::Esc | KeyCode::Enter) {
                 ui.help = false;
+            }
+            continue;
+        }
+        if code == KeyCode::Char('g') {
+            match super::solver_ui::SolverUi::new(None) {
+                Ok(solver) => ui.solver = Some(solver),
+                Err(error) => ui.status = error,
             }
             continue;
         }
@@ -1097,6 +1118,10 @@ fn apply_api_key_field(
     handled
 }
 fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
+    if let Some(solver) = &ui.solver {
+        solver.draw(frame);
+        return;
+    }
     if let Some(replay) = &ui.replay {
         replay.draw(frame);
         return;
@@ -1184,7 +1209,7 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
         let kind = selected_provider(ui.session.settings.coaching).expect("cloud consent provider");
         (" ENABLE OPTIONAL CLOUD COACHING ",format!("Destination: {}\nModel: {} · credential: {} or OS keychain\nOnly your pre-decision cards, public table/action data and teaching facts leave this device.\nProvider charges and data terms apply. Limit: {} requests / session.\nEnter enables paid coaching this session. Esc or L plays with local teaching.\nNo request is made until you accept a poker decision.",kind.endpoint(),ui.session.settings.cloud.model,kind.environment(),ui.session.settings.cloud.max_requests))
     } else if ui.help {
-        (" HOW TO PLAY ","F folds · C checks or calls · R opens bet/raise TO entry in chips.\nEnter submits an amount; arrows adjust by one chip. A asks for all-in confirmation.\nAfter every accepted decision the table pauses: Enter continues, ? expands teaching.\nBetween hands: V browses saved hands; B tops up/rebuys; W withdraws; Enter deals.\nIn replay: arrows browse; B bookmarks; O shows outcome; Esc returns.\nRun openfelt --drill <topic> for a short offline practice set.\nS opens settings. Between hands, Updates can check for a release; it never installs by itself.\nBots use reviewed heuristic ranges, style, and difficulty—not solver strategies.\nSettings and private learning history live in your local OpenFelt data folder.\nQ quits at any time. No timer acts for you.".into())
+        (" HOW TO PLAY ","F folds · C checks or calls · R opens bet/raise TO entry in chips.\nEnter submits an amount; arrows adjust by one chip. A asks for all-in confirmation.\nAfter every accepted decision the table pauses: Enter continues, ? expands teaching.\nBetween hands: V browses saved hands; B tops up/rebuys; W withdraws; Enter deals.\nIn replay: arrows browse; B bookmarks; O shows outcome; Esc returns.\nRun openfelt --drill <topic> for a short offline practice set.\nG opens local river solver practice; Esc returns to the table.\nS opens settings. Between hands, Updates can check for a release; it never installs by itself.\nBots use reviewed heuristic ranges, style, and difficulty—not solver strategies.\nSettings and private learning history live in your local OpenFelt data folder.\nQ quits at any time. No timer acts for you.".into())
     } else if matches!(ui.input, Input::AllIn) {
         (
             " CONFIRM ALL-IN ",
@@ -1526,6 +1551,7 @@ mod tests {
             cash_saved: 0,
             replay_saved: 0,
             replay: None,
+            solver: None,
             saved_progress: vec![],
             settings: None,
             credential_test: None,

@@ -3,7 +3,7 @@ name = "terminal-poker"
 version = "1.0.1"
 edition = "2021"
 description = "OpenFelt: local play-money Hold'em learning with optional bring-your-own-key coaching"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 repository = "https://github.com/jdavies69/openfelt"
 keywords = ["poker", "terminal", "tui", "game", "training"]
 categories = ["games", "command-line-utilities"]
@@ -96,6 +96,8 @@ name = "review-sprint16"
 path = "src/bin/review_sprint16.rs"
 
 [dependencies]
+postflop-solver = { path = "vendor/postflop-solver", default-features = false, features = ["rayon"] }
+rayon = "1.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 tar = "0.4"

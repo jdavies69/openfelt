@@ -13,6 +13,10 @@ args = parser.parse_args()
 OUT = ROOT / args.output_dir
 OUT.mkdir(parents=True, exist_ok=True)
 files = [ROOT / "Cargo.toml", ROOT / "Cargo.lock"]
+files.extend(ROOT / name for name in ("LICENSE", "LICENSE-MIT", "LICENSE-AGPL", "THIRD_PARTY_NOTICES.md", "README.md"))
+for directory in ("vendor", "scripts"):
+    files.extend(p for p in sorted((ROOT / directory).rglob("*"))
+                 if p.is_file() and "__pycache__" not in p.parts and "target" not in p.parts)
 for directory in ("src", "tests", "examples"):
     files.extend(sorted((ROOT / directory).rglob("*.rs")))
 files.extend(sorted((ROOT / "assets/branding").glob("*.png")))

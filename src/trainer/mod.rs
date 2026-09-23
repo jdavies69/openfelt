@@ -9,6 +9,8 @@ pub mod policy;
 pub mod provider;
 pub mod replay;
 pub mod replay_ui;
+pub mod solver;
+pub mod solver_ui;
 pub mod storage;
 pub mod table_ui;
 pub mod tui;
