@@ -20,13 +20,14 @@ ANSI = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 class Game:
-    def __init__(self, root, *args):
+    def __init__(self, root, *args, test_env=None):
         self.root = Path(root)
         self.master, slave = pty.openpty()
         self.resize(80, 30)
         env = dict(os.environ)
         env.pop("OPENAI_API_KEY", None)
         env.pop("ANTHROPIC_API_KEY", None)
+        env.update(test_env or {})
         env["TERM"] = "xterm-256color"
 
         def terminal_session():
@@ -174,14 +175,27 @@ with tempfile.TemporaryDirectory(prefix="openfelt-pty-") as root:
     print("PASS: selected-setting help preserves edits; solver On/Off persists across restarts")
 
     # A temporary data directory does not isolate the OS credential store.
-    # Decline cloud access here; mocked Rust tests cover missing credentials.
-    g = Game(Path(root) / "cloud-declined", "--coaching", "openai", "--model", "fixture-model")
-    assert b"ENABLE OPTIONAL CLOUD COACHING" in ANSI.sub(b"", g.output)
-    g.send("\x1b")
+    # An empty environment credential fails validation before any Keychain or
+    # HTTP access. It lets us test activation/persistence without a real key.
+    cloud_root = Path(root) / "cloud-persistent"
+    g = Game(cloud_root, "--coaching", "openai", "--model", "fixture-model",
+             "--save-settings", test_env={"OPENAI_API_KEY": ""})
+    assert b"ENABLE OPTIONAL CLOUD COACHING" not in ANSI.sub(b"", g.output)
     g.send("C")
     assert len(g.decisions()) == 1
-    g.send("\r")
     g.quit()
-    print("PASS: declining cloud consent permits local play without credential access")
+    assert json.loads((cloud_root / "settings.json").read_text())["coaching"] == "openai"
+    g = Game(cloud_root, test_env={"OPENAI_API_KEY": ""})
+    assert b"ENABLE OPTIONAL CLOUD COACHING" not in ANSI.sub(b"", g.output)
+    assert b"OpenAI coaching" in ANSI.sub(b"", g.output)
+    g.send("s")
+    g.send("\x1b[C" * 2)  # OpenAI -> Anthropic -> Local
+    g.send("\x1b[B" * 8)
+    g.send("\r")
+    assert json.loads((cloud_root / "settings.json").read_text())["coaching"] == "local"
+    g.send("C")
+    assert len(g.decisions()) == 2
+    g.quit()
+    print("PASS: cloud provider persists/activates on restart; selecting Local disables it")
 
 print("All OpenFelt PTY smoke tests passed.")

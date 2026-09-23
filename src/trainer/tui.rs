@@ -187,7 +187,6 @@ struct Ui {
     deep: bool,
     deep_scroll: u16,
     help: bool,
-    consent: bool,
     cloud_enabled: bool,
     provider_feedback: bool,
     usage: Usage,
@@ -213,7 +212,7 @@ pub fn run(
     first_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let progress = store.progress()?;
-    let consent = requires_cloud_consent(settings.coaching);
+    let cloud_enabled = selected_provider(settings.coaching).is_some();
     let mut ui = Ui {
         session: Session::new(settings)?,
         input: Input::Play,
@@ -227,8 +226,7 @@ pub fn run(
         deep: false,
         deep_scroll: 0,
         help: false,
-        consent,
-        cloud_enabled: false,
+        cloud_enabled,
         provider_feedback: false,
         usage: Usage::default(),
         progress,
@@ -338,8 +336,7 @@ pub fn run(
             redraw = true;
             last_size = Some(size);
         }
-        if !ui.consent
-            && !ui.help
+        if !ui.help
             && ui.settings.is_none()
             && ui.replay.is_none()
             && ui.solver.is_none()
@@ -594,7 +591,7 @@ pub fn run(
                                     .expect("validated settings");
                                 ui.first_run = false;
                                 ui.status = if editor.key.is_empty() {
-                                    "Setup saved; local table is ready".into()
+                                    format!("Setup saved; {} selected", active_coaching_label(&ui))
                                 } else {
                                     format!(
                                         "Setup saved with API key. {}",
@@ -605,15 +602,10 @@ pub fn run(
                                 apply_saved_settings(&mut ui, editor.draft.clone(), false)
                                     .expect("validated settings");
                                 ui.status = if editor.key.is_empty() {
-                                    if ui.consent {
-                                        "Settings saved; approve cloud coaching for this session"
-                                            .into()
-                                    } else {
-                                        format!(
-                                            "Settings saved; {} active",
-                                            active_coaching_label(&ui)
-                                        )
-                                    }
+                                    format!(
+                                        "Settings saved; {} selected",
+                                        active_coaching_label(&ui)
+                                    )
                                 } else {
                                     format!(
                                         "Settings and API key saved. {}",
@@ -658,18 +650,6 @@ pub fn run(
             match super::replay_ui::ReplayUi::open(&store) {
                 Ok(replay) => ui.replay = Some(replay),
                 Err(e) => ui.status = e,
-            }
-            continue;
-        }
-        if ui.consent {
-            match code {
-                KeyCode::Enter => {
-                    accept_cloud_for_session(&mut ui);
-                }
-                KeyCode::Esc | KeyCode::Char('l') => {
-                    skip_cloud_for_session(&mut ui);
-                }
-                _ => {}
             }
             continue;
         }
@@ -918,14 +898,12 @@ fn apply_saved_settings(
 ) -> Result<(), String> {
     let same_cloud_target = ui.session.settings.coaching == settings.coaching
         && ui.session.settings.cloud.model == settings.cloud.model;
-    let keep_cloud_enabled = !reset_session && ui.cloud_enabled && same_cloud_target;
     if reset_session {
         ui.session = Session::new(settings)?;
     } else {
         ui.session.settings = settings;
     }
-    ui.cloud_enabled = keep_cloud_enabled;
-    ui.consent = selected_provider(ui.session.settings.coaching).is_some() && !keep_cloud_enabled;
+    ui.cloud_enabled = selected_provider(ui.session.settings.coaching).is_some();
     ui.pending = None;
     if !same_cloud_target || reset_session {
         ui.provider_feedback = false;
@@ -945,32 +923,9 @@ fn apply_saved_settings(
     Ok(())
 }
 
-fn requires_cloud_consent(mode: CoachingMode) -> bool {
-    selected_provider(mode).is_some()
-}
-
-fn accept_cloud_for_session(ui: &mut Ui) {
-    ui.consent = false;
-    ui.cloud_enabled = true;
-    ui.status =
-        "Cloud coaching enabled for this session · optional calls may incur provider charges"
-            .into();
-}
-
-fn skip_cloud_for_session(ui: &mut Ui) {
-    ui.consent = false;
-    ui.cloud_enabled = false;
-    let saved = selected_provider(ui.session.settings.coaching)
-        .map(provider_label)
-        .unwrap_or("cloud");
-    ui.status =
-        format!("Local coaching this session · {saved} remains selected · no network requests");
-}
-
 fn active_coaching_label(ui: &Ui) -> String {
     let base = match selected_provider(ui.session.settings.coaching) {
-        Some(provider) if ui.cloud_enabled => format!("{} coaching", provider_label(provider)),
-        Some(provider) => format!("local · {} selected", provider_label(provider)),
+        Some(provider) => format!("{} coaching", provider_label(provider)),
         None if ui.session.settings.coaching == CoachingMode::Off => "coaching off".into(),
         None => "local coaching".into(),
     };
@@ -1220,7 +1175,7 @@ fn ui_settings_placeholder() -> Settings {
 }
 fn settings_help(field: usize) -> (&'static str, &'static str) {
     match field {
-        0 => ("Provider", "Select local, OpenAI, or Anthropic coaching. Local needs no key or network. A cloud choice still needs session consent before requests. Changes apply when you save."),
+        0 => ("Provider", "Select local, OpenAI, or Anthropic coaching. A saved cloud choice stays selected across launches and can request coaching after accepted decisions. Local and Off use no cloud provider. Changes apply when you save."),
         1 => ("Model", "Choose a listed provider model with Left/Right, or press E to type a custom model ID. This matters only for cloud coaching. Changes apply when you save."),
         2 => ("API key", "Type or paste a provider key for optional cloud coaching. Ctrl-V changes visibility and Ctrl-X confirms forgetting a saved key. Help never displays the key. A new key is stored only when you save."),
         3 => ("Session limit", "Maximum optional cloud coaching requests in one session. Left/Right adjusts the limit; it does not affect local solver calculations. Save to apply."),
@@ -1259,7 +1214,7 @@ fn credential_source_label(mode: CoachingMode, entered: bool) -> String {
     if entered {
         "entered; not saved".into()
     } else if selected_provider(mode).is_some() {
-        "saved key not checked".into()
+        "key checked when coaching runs".into()
     } else {
         "local; no key needed".into()
     }
@@ -1441,11 +1396,8 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
     }
     let p = ui.session.view();
     let bb = f64::from(ui.session.settings.big_blind);
-    let (title, body) = if ui.consent {
-        let kind = selected_provider(ui.session.settings.coaching).expect("cloud consent provider");
-        (" ENABLE OPTIONAL CLOUD COACHING ",format!("Destination: {}\nModel: {} · credential: {} or OS keychain\nOnly your pre-decision cards, public table/action data and teaching facts leave this device.\nProvider charges and data terms apply. Limit: {} requests / session.\nEnter enables paid coaching this session. Esc or L plays with local teaching.\nNo request is made until you accept a poker decision.",kind.endpoint(),ui.session.settings.cloud.model,kind.environment(),ui.session.settings.cloud.max_requests))
-    } else if ui.help {
-        (" HOW TO PLAY ","F folds · C checks or calls · R opens bet/raise TO entry in chips.\nEnter submits an amount; arrows adjust by one chip. A asks for all-in confirmation.\nAfter every accepted decision the table pauses: Enter continues, ? expands teaching.\nBetween hands: V browses saved hands; B tops up/rebuys; W withdraws; Enter deals.\nIn replay: arrows browse; B bookmarks; O shows outcome; Esc returns.\nRun openfelt --drill <topic> for a short offline practice set.\nG opens local river solver practice; Esc returns to the table.\nS opens settings. Between hands, Updates can check for a release; it never installs by itself.\nBots use reviewed heuristic ranges, style, and difficulty—not solver strategies.\nSettings and private learning history live in your local OpenFelt data folder.\nQ quits at any time. No timer acts for you.".into())
+    let (title, body) = if ui.help {
+        (" HOW TO PLAY ","F folds · C checks or calls · R opens bet/raise TO entry in chips.\nEnter submits an amount; arrows adjust by one chip. A asks for all-in confirmation.\nAfter every accepted decision the table pauses: Enter continues, ? expands teaching.\nBetween hands: V browses saved hands; B tops up/rebuys; W withdraws; Enter deals.\nIn replay: arrows browse; B bookmarks; O shows outcome; Esc returns.\nRun openfelt --drill <topic> for a short offline practice set.\nG opens local river solver practice; Esc returns to the table.\nS opens settings. A saved cloud provider stays selected across launches; Local or Off stops requests.\nBetween hands, Updates can check for a release; it never installs by itself.\nBots use reviewed heuristic ranges, style, and difficulty—not solver strategies.\nSettings and private learning history live in your local OpenFelt data folder.\nQ quits at any time. No timer acts for you.".into())
     } else if matches!(ui.input, Input::AllIn) {
         (
             " CONFIRM ALL-IN ",
@@ -1623,7 +1575,7 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
         },
     );
 
-    if ui.help || ui.consent {
+    if ui.help {
         let panel = ratatui::layout::Rect {
             x: area.x + 5,
             y: area.y + 4,
@@ -1866,7 +1818,6 @@ mod tests {
             deep: false,
             deep_scroll: 0,
             help: false,
-            consent: false,
             cloud_enabled: false,
             provider_feedback: false,
             usage: Usage::default(),
@@ -1927,56 +1878,44 @@ mod tests {
         assert_eq!(editor.source, "local; no key needed");
         assert_eq!(
             credential_source_label(CoachingMode::Openai, false),
-            "saved key not checked"
+            "key checked when coaching runs"
         );
-        let mut cloud_ui = ui(2);
-        cloud_ui.session.settings.coaching = CoachingMode::Openai;
-        cloud_ui.consent = true;
+        let cloud_ui = ui(2);
         assert!(cloud_ui.credentials.openai.is_none());
         assert!(cloud_ui.credentials.anthropic.is_none());
     }
 
     #[test]
-    fn saved_cloud_provider_survives_skip_save_and_relaunch_without_key_access() {
+    fn saved_cloud_provider_stays_enabled_until_local_or_off_without_key_access() {
         let mut ui = ui(2);
         let mut saved = ui.session.settings.clone();
         saved.coaching = CoachingMode::Openai;
         saved.cloud.model = "gpt-5.4-nano".into();
 
         apply_saved_settings(&mut ui, saved.clone(), false).unwrap();
-        assert!(ui.consent);
-        assert!(!ui.cloud_enabled);
+        assert!(ui.cloud_enabled);
         assert_eq!(ui.session.settings.coaching, CoachingMode::Openai);
-        assert_eq!(active_coaching_label(&ui), "local · OpenAI selected");
-        assert!(ui.credentials.openai.is_none());
-
-        skip_cloud_for_session(&mut ui);
-        assert!(!ui.consent && !ui.cloud_enabled);
-        assert_eq!(ui.session.settings.coaching, CoachingMode::Openai);
-        assert!(ui.status.contains("OpenAI remains selected"));
-        assert!(requires_cloud_consent(saved.coaching));
-
-        apply_saved_settings(&mut ui, saved.clone(), false).unwrap();
-        assert!(ui.consent, "saving while local asks before enabling cloud");
-        accept_cloud_for_session(&mut ui);
         assert_eq!(active_coaching_label(&ui), "OpenAI coaching");
-        assert!(
-            ui.credentials.openai.is_none(),
-            "consent does not read a key"
-        );
+        assert!(ui.credentials.openai.is_none());
 
         let mut unrelated = saved;
         unrelated.seats = 3;
         apply_saved_settings(&mut ui, unrelated, false).unwrap();
-        assert!(
-            ui.cloud_enabled,
-            "unrelated settings preserve session consent"
-        );
-        assert!(!ui.consent);
+        assert!(ui.cloud_enabled);
+        assert!(ui.credentials.openai.is_none());
+
+        let mut local = ui.session.settings.clone();
+        local.coaching = CoachingMode::Local;
+        apply_saved_settings(&mut ui, local, false).unwrap();
+        assert!(!ui.cloud_enabled);
+        let mut off = ui.session.settings.clone();
+        off.coaching = CoachingMode::Off;
+        apply_saved_settings(&mut ui, off, false).unwrap();
+        assert!(!ui.cloud_enabled);
     }
 
     #[test]
-    fn unrelated_settings_save_roundtrips_the_selected_cloud_provider_after_skip() {
+    fn unrelated_settings_save_roundtrips_active_cloud_provider() {
         let root = std::env::temp_dir().join(format!(
             "openfelt-provider-persistence-{}-{:016x}",
             std::process::id(),
@@ -1989,34 +1928,39 @@ mod tests {
         };
         store.save("settings.json", &saved).unwrap();
 
-        let mut ui = ui(2);
-        apply_saved_settings(&mut ui, store.settings().unwrap(), false).unwrap();
-        skip_cloud_for_session(&mut ui);
+        let mut current = ui(2);
+        apply_saved_settings(&mut current, store.settings().unwrap(), false).unwrap();
+        assert!(current.cloud_enabled);
         saved.seats = 3;
-        apply_saved_settings(&mut ui, saved.clone(), false).unwrap();
-        store.save("settings.json", &ui.session.settings).unwrap();
+        apply_saved_settings(&mut current, saved.clone(), false).unwrap();
+        store
+            .save("settings.json", &current.session.settings)
+            .unwrap();
 
         let reloaded = store.settings().unwrap();
         assert_eq!(reloaded.coaching, CoachingMode::Openai);
         assert_eq!(reloaded.seats, 3);
-        assert!(requires_cloud_consent(reloaded.coaching));
+        let mut relaunched = ui(2);
+        apply_saved_settings(&mut relaunched, reloaded, false).unwrap();
+        assert!(relaunched.cloud_enabled);
+        assert!(relaunched.credentials.openai.is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn changing_cloud_destination_requires_fresh_consent_without_resolving_a_key() {
+    fn changing_cloud_destination_activates_saved_provider_without_resolving_a_key() {
         let mut ui = ui(2);
         let mut openai = ui.session.settings.clone();
         openai.coaching = CoachingMode::Openai;
         apply_saved_settings(&mut ui, openai, false).unwrap();
-        accept_cloud_for_session(&mut ui);
+        assert!(ui.cloud_enabled);
 
         let mut anthropic = ui.session.settings.clone();
         anthropic.coaching = CoachingMode::Anthropic;
         anthropic.cloud.model = "claude-sonnet-4-5".into();
         apply_saved_settings(&mut ui, anthropic, false).unwrap();
-        assert!(ui.consent);
-        assert!(!ui.cloud_enabled);
+        assert!(ui.cloud_enabled);
+        assert_eq!(active_coaching_label(&ui), "Anthropic coaching");
         assert!(ui.credentials.openai.is_none());
         assert!(ui.credentials.anthropic.is_none());
     }
