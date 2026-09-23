@@ -77,6 +77,7 @@ pub struct TableRenderState<'a> {
     pub hand_label: Option<&'a str>,
     pub review_tone: Option<ReviewTone>,
     pub guidance_source: Option<&'a str>,
+    pub active_coaching: &'a str,
 }
 
 pub fn render(frame: &mut Frame<'_>, state: &TableRenderState<'_>) {
@@ -136,7 +137,7 @@ pub fn render(frame: &mut Frame<'_>, state: &TableRenderState<'_>) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("● ", Style::default().fg(GREEN)),
-            Span::styled("local", Style::default().fg(MUTED)),
+            Span::styled(state.active_coaching, Style::default().fg(MUTED)),
         ]))
         .style(Style::default().bg(BG)),
         footer[0],
@@ -1421,6 +1422,7 @@ mod tests {
             hand_label: None,
             review_tone: tone,
             guidance_source: Some("heuristic guidance"),
+            active_coaching: "local coaching",
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
         terminal.draw(|frame| render(frame, &state)).unwrap();

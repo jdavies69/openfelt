@@ -348,6 +348,7 @@ fn capture(
                     .as_ref()
                     .map(|feedback| table_ui::ReviewTone::from_assessment(&feedback.assessment)),
                 guidance_source: feedback.as_ref().map(|_| "Local guidance · heuristic"),
+                active_coaching: "local coaching",
             },
         );
         if let Some((body, title)) = details {
