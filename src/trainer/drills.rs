@@ -163,6 +163,21 @@ fn drill_for(concept: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// Maps reviewed coaching concepts to the closest available categorical drill.
+/// These drills teach the related idea; they do not recreate a solver tree or
+/// claim that the archived alternative is uniquely correct.
+pub fn topic_for_concept(concept: &str) -> Option<DrillTopic> {
+    match concept {
+        "Preflop position-aware opening" | "Preflop after limpers" => Some(DrillTopic::Position),
+        "Preflop facing a raise" => Some(DrillTopic::StartingHands),
+        "Postflop calling price" => Some(DrillTopic::CallingPrices),
+        "Postflop: betting purpose" | "Postflop: value betting" | "Heads-up river action EV" => {
+            Some(DrillTopic::ValueBetting)
+        }
+        _ => None,
+    }
+}
+
 pub fn run<R: BufRead, W: Write>(
     topic: DrillTopic,
     seed: u64,

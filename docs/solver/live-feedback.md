@@ -9,9 +9,11 @@ solver job while showing the existing immediate teaching. A successful result
 appears in that same review, labeled **Solver · modeled ranges**. Press **?** for
 both separately labeled solver analysis and the existing local or cloud coaching
 explanation. Cloud coaching follows the saved provider selection and request budget;
-it cannot replace the solver's numerical grade. Continue whenever you want; leaving the
-review cancels the job. Turning the setting Off cancels pending solver work and
-restores ordinary coaching. No API key or network request is required by the solver.
+it cannot replace the solver's numerical grade. Continue whenever you want: pending
+results attach to the original decision in saved hand review. **Practice pace → Play**
+continues immediately after each decision; **Learn** pauses until Enter. At hand end,
+press **R** or **V** to review. Turning the solver setting Off cancels pending solver
+work and restores ordinary coaching. No API key or network request is required by the solver.
 
 ## What is modeled
 

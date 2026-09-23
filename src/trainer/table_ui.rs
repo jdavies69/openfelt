@@ -4,7 +4,13 @@
 //! It owns geometry and styling, never game state or input handling.
 
 use crate::{
-    game::{deck::Card, hand::evaluate_hand, seat::SeatId, table::HandParticipation},
+    game::{
+        deck::Card,
+        hand::evaluate_hand,
+        multiway::{build_pots, Contribution},
+        seat::SeatId,
+        table::HandParticipation,
+    },
     protocol::{ProjectedSeat, TableProjection},
 };
 use ratatui::{
@@ -109,6 +115,14 @@ pub fn render(frame: &mut Frame<'_>, state: &TableRenderState<'_>) {
             Constraint::Length(3),
             Constraint::Min(14),
             Constraint::Length(8),
+            Constraint::Length(1),
+        ])
+        .split(shell)
+    } else if state.mode == TableMode::Complete {
+        Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Min(19),
+            Constraint::Length(7),
             Constraint::Length(1),
         ])
         .split(shell)
@@ -345,15 +359,32 @@ fn wrapped_excerpt(copy: &str, width: u16, max_lines: usize) -> String {
     lines.join("\n")
 }
 
-/// Expanded coaching keeps the hero cards and controls visible below a wide,
-/// readable teaching panel.
+/// Expanded coaching occupies the right rail, preserving board and hero cards.
 pub fn render_coaching_details(frame: &mut Frame<'_>, title: &str, body: &str, scroll: u16) {
     let area = frame.area();
+    if area.width < 80 || area.height < 30 {
+        return;
+    }
+    let shell_width = area.width.min(128);
+    let shell_height = area.height.min(38);
+    let shell = Rect::new(
+        area.x + area.width.saturating_sub(shell_width) / 2,
+        area.y + area.height.saturating_sub(shell_height) / 2,
+        shell_width,
+        shell_height,
+    );
+    let rail_width = if shell.width >= 110 { 28 } else { 23 };
+    let rail_x = shell.x + shell.width.saturating_sub(rail_width);
+    let detail_title = if title.contains("SOLVER") {
+        " SOLVER REVIEW "
+    } else {
+        " DECISION REVIEW "
+    };
     let panel = Rect::new(
-        area.x + 5,
-        area.y + 3,
-        area.width.saturating_sub(10),
-        area.height.saturating_sub(15),
+        rail_x,
+        shell.y + 3,
+        area.x + area.width - rail_x,
+        shell.height.saturating_sub(3 + 8 + 1),
     );
     frame.render_widget(Clear, panel);
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(panel);
@@ -368,21 +399,25 @@ pub fn render_coaching_details(frame: &mut Frame<'_>, title: &str, body: &str, s
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(title)
+                    .title(detail_title)
                     .border_style(Style::default().fg(GREEN))
                     .style(Style::default().bg(BG)),
             ),
         rows[0],
     );
     frame.render_widget(
-        Paragraph::new("↑/↓ scroll · PgUp/PgDn page · Esc close · Enter continue")
-            .alignment(Alignment::Center)
-            .style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(GREEN)
-                    .add_modifier(Modifier::BOLD),
-            ),
+        Paragraph::new(if panel.width < 35 {
+            "↑↓ scroll · Esc back"
+        } else {
+            "↑/↓ scroll · Esc close · Enter continue"
+        })
+        .alignment(Alignment::Center)
+        .style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(GREEN)
+                .add_modifier(Modifier::BOLD),
+        ),
         rows[1],
     );
 }
@@ -407,7 +442,7 @@ fn wrapped_lines(line: &str, width: usize) -> usize {
     let mut lines = 1;
     let mut used = 0;
     for word in line.split_whitespace() {
-        let len = word.chars().count();
+        let len = Line::from(word).width();
         if used > 0 && used + 1 + len > width {
             lines += 1;
             used = len;
@@ -512,6 +547,7 @@ struct HandResult {
     detail: String,
     winning_hand: Option<String>,
     hero_won: bool,
+    hero_net: i64,
 }
 
 fn hand_result(projection: &TableProjection, hero: SeatId) -> Option<HandResult> {
@@ -524,27 +560,30 @@ fn hand_result(projection: &TableProjection, hero: SeatId) -> Option<HandResult>
     }
 
     let hero_total = totals.get(&hero).copied().unwrap_or_default();
-    let hero_shared = projection
-        .awards
-        .iter()
-        .any(|award| award.winners.len() > 1 && award.winners.contains(&hero));
     let any_shared = projection
         .awards
         .iter()
         .any(|award| award.winners.len() > 1);
-    let headline = if hero_shared {
+    let headline = if any_shared
+        && projection
+            .awards
+            .iter()
+            .all(|award| award.winners.len() > 1)
+    {
         "SPLIT POT".to_string()
+    } else if totals.len() > 1 && hero_total > 0 {
+        "YOU WON A POT".to_string()
+    } else if totals.len() > 1 {
+        "MULTIPLE POT WINNERS".to_string()
     } else if hero_total > 0 {
         "YOU WIN".to_string()
-    } else if any_shared {
-        "SPLIT POT".to_string()
     } else if totals.len() == 1 {
         let winner = *totals.keys().next().expect("non-empty payouts");
         format!("{} WINS", seat_name(winner, hero).to_ascii_uppercase())
     } else {
-        "POTS AWARDED".to_string()
+        "HAND COMPLETE".to_string()
     };
-    let detail = totals
+    let recipients = totals
         .iter()
         .map(|(seat, amount)| {
             if *seat == hero {
@@ -553,8 +592,16 @@ fn hand_result(projection: &TableProjection, hero: SeatId) -> Option<HandResult>
                 format!("Bot {} receives {amount} chips", seat.as_u8())
             }
         })
-        .collect::<Vec<_>>()
-        .join("  ·  ");
+        .collect::<Vec<_>>();
+    let detail = if recipients.len() > 2 {
+        format!(
+            "{}  ·  +{} more",
+            recipients[..2].join("  ·  "),
+            recipients.len() - 2
+        )
+    } else {
+        recipients.join("  ·  ")
+    };
 
     // A single winner's evaluated hand is unambiguous. For a genuinely shared
     // pot, show the hand only when every winner's authorized cards are visible
@@ -574,11 +621,47 @@ fn hand_result(projection: &TableProjection, hero: SeatId) -> Option<HandResult>
     };
     let winning_hand = visible_shared_description(projection, &winning_seats);
 
+    let contribution = projection
+        .seats
+        .iter()
+        .find(|seat| seat.seat == hero)
+        .map_or(0, |seat| seat.hand_contribution);
+    let total_contributions: u32 = projection
+        .seats
+        .iter()
+        .map(|seat| seat.hand_contribution)
+        .sum();
+    let total_awards: u32 = projection.awards.iter().map(|award| award.amount).sum();
+    let returned = if total_awards < total_contributions {
+        let entries = projection
+            .seats
+            .iter()
+            .map(|seat| Contribution {
+                seat: seat.seat,
+                amount: seat.hand_contribution,
+                eligible: matches!(
+                    seat.participation,
+                    HandParticipation::Live | HandParticipation::AllIn
+                ),
+            })
+            .collect::<Vec<_>>();
+        build_pots(&entries)
+            .returned
+            .iter()
+            .filter(|item| item.seat == hero)
+            .map(|item| item.amount)
+            .sum::<u32>()
+    } else {
+        0
+    };
+    let hero_net = i64::from(hero_total) + i64::from(returned) - i64::from(contribution);
+
     Some(HandResult {
         headline,
         detail,
         winning_hand,
         hero_won: hero_total > 0,
+        hero_net,
     })
 }
 
@@ -610,7 +693,7 @@ fn render_hand_result(frame: &mut Frame<'_>, state: &TableRenderState<'_>, avail
     };
     let height = available
         .height
-        .min(if result.winning_hand.is_some() { 6 } else { 5 });
+        .min(if result.winning_hand.is_some() { 7 } else { 6 });
     let width = available.width.saturating_sub(8).min(64);
     let area = Rect::new(
         available.x + available.width.saturating_sub(width) / 2,
@@ -632,6 +715,12 @@ fn render_hand_result(frame: &mut Frame<'_>, state: &TableRenderState<'_>, avail
             Style::default().fg(MUTED),
         )));
     }
+    lines.push(Line::from(Span::styled(
+        format!("Your hand: {:+} chips", result.hero_net),
+        Style::default()
+            .fg(if result.hero_net >= 0 { GREEN } else { YELLOW })
+            .add_modifier(Modifier::BOLD),
+    )));
     lines.push(Line::from(Span::styled(
         "Enter · next hand   V · replay",
         Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -997,7 +1086,7 @@ fn render_card_back(frame: &mut Frame<'_>, area: Rect) {
 
 fn render_card(frame: &mut Frame<'_>, area: Rect, card: &Card) {
     let rank = if card.rank == crate::game::deck::Rank::Ten {
-        "T"
+        "10"
     } else {
         card.rank.symbol()
     };
@@ -1011,10 +1100,11 @@ fn render_card(frame: &mut Frame<'_>, area: Rect, card: &Card) {
         .bg(CARD_FACE)
         .add_modifier(Modifier::BOLD);
     let width = usize::from(area.width);
+    let rank_width = Line::from(rank).width();
     let mut lines = vec![
         Line::from(vec![
             Span::styled(rank.to_string(), face),
-            Span::styled(" ".repeat(width.saturating_sub(1)), face),
+            Span::styled(" ".repeat(width.saturating_sub(rank_width)), face),
         ]),
         Line::from(Span::styled(
             format!(
@@ -1026,7 +1116,7 @@ fn render_card(frame: &mut Frame<'_>, area: Rect, card: &Card) {
             face,
         )),
         Line::from(vec![
-            Span::styled(" ".repeat(width.saturating_sub(1)), face),
+            Span::styled(" ".repeat(width.saturating_sub(rank_width)), face),
             Span::styled(rank.to_string(), face),
         ]),
     ];
@@ -1319,11 +1409,13 @@ mod tests {
     use super::*;
     use crate::{
         game::{
+            actions::Action,
             deck::{Rank, Suit},
             multiway::{MultiwayPhase, PotAward, SeatPayout},
             seat::TableSize,
         },
         protocol::{HandId, ProjectionKind},
+        trainer::{hero, policy::PolicySettings, storage::Settings, Session},
     };
     use ratatui::{backend::TestBackend, Terminal};
 
@@ -1439,9 +1531,14 @@ mod tests {
     fn minimum_viewport_makes_hero_win_prominent() {
         let projection = projection(vec![award(40, &[0], &[(0, 40)])], None);
         let text = rendered(&projection, None);
+        let winning_hand = hand_result(&projection, seat(0))
+            .unwrap()
+            .winning_hand
+            .unwrap();
         assert!(text.contains("YOU WIN"));
         assert!(text.contains("You receive 40 chips"));
-        assert!(text.contains("Winning hand"));
+        assert!(text.contains(&format!("Winning hand · {winning_hand}")));
+        assert!(text.contains("Your hand: +20 chips"));
         assert!(text.contains("Enter · next hand"));
     }
 
@@ -1452,6 +1549,7 @@ mod tests {
         assert!(text.contains("BOT 1 WINS"));
         assert!(text.contains("Bot 1 receives 40 chips"));
         assert!(!text.contains("Winning hand"));
+        assert!(text.contains("Your hand: -20 chips"));
     }
 
     #[test]
@@ -1465,6 +1563,155 @@ mod tests {
     }
 
     #[test]
+    fn unmatched_excess_is_included_in_hand_net() {
+        let mut projection = projection(vec![award(80, &[0], &[(0, 80)])], None);
+        projection.seats[0].hand_contribution = 100;
+        projection.seats[1].hand_contribution = 40;
+        let result = hand_result(&projection, seat(0)).unwrap();
+        assert_eq!(result.hero_net, 40);
+    }
+
+    #[test]
+    fn settled_seeded_hands_match_engine_stack_change() {
+        for seats in [2, 3, 6] {
+            for style in 0..3 {
+                for seed in [1, 7, 23, 41] {
+                    let settings = Settings {
+                        seats,
+                        opponents: PolicySettings {
+                            aggression: 0.0,
+                            bluff_rate: 0.0,
+                            mistake_rate: 0.0,
+                            ..PolicySettings::default()
+                        },
+                        ..Settings::default()
+                    };
+                    let mut session = Session::new_seeded_for_evaluation(settings, seed).unwrap();
+                    for _ in 0..256 {
+                        if session.finished() {
+                            break;
+                        }
+                        if session.view().to_act == Some(hero()) {
+                            let observation = session.observation(hero()).unwrap();
+                            let action = match style {
+                                1 if observation.legal.can_fold => Action::Fold,
+                                2 if observation.legal.can_all_in() => {
+                                    Action::AllIn(observation.legal.all_in_to)
+                                }
+                                _ => observation.check_call(),
+                            };
+                            session.submit(action).unwrap();
+                            session.continue_hand();
+                        } else {
+                            assert!(
+                                session.step_bot().unwrap(),
+                                "no actor advanced for {seats} seats, style {style}, seed {seed}"
+                            );
+                        }
+                    }
+                    assert!(
+                        session.finished(),
+                        "hand did not settle for {seats} seats, style {style}, seed {seed}"
+                    );
+                    let final_projection = session.view();
+                    let final_stack = final_projection
+                        .seats
+                        .iter()
+                        .find(|seat| seat.seat == hero())
+                        .unwrap()
+                        .stack;
+                    let expected = i64::from(final_stack) - i64::from(session.opening_hero_stack);
+                    let result = hand_result(&final_projection, hero()).unwrap();
+                    assert_eq!(
+                        result.hero_net, expected,
+                        "{seats} seats, style {style}, seed {seed}; awards={:?}",
+                        final_projection.awards
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_review_preserves_cards_at_common_terminal_sizes() {
+        let projection = projection(vec![], None);
+        for (width, height) in [(80, 30), (120, 40), (165, 47)] {
+            let state = TableRenderState {
+                projection: &projection, hero: seat(0), hand_id: 7, recent_actions: &[],
+                status: "", mode: TableMode::Paused, notice_title: Some("REVIEW"),
+                notice: Some("BEFORE ACTION you checked\nWHY a careful check controls the pot\nCONSIDER a bet"),
+                raise: None, hand_label: Some("Broadway straight"), review_tone: Some(ReviewTone::Good),
+                guidance_source: Some("solver review"), active_coaching: "local review",
+            };
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &state)).unwrap();
+            let before = terminal.backend().buffer().clone();
+            terminal.draw(|frame| {
+                render(frame,&state);
+                render_coaching_details(frame," AFTER YOUR DECISION · SOLVER ",
+                    "YOUR CHOICE\nCheck: the board and your cards remain visible.\nMODEL\nRanges and bet sizes are assumptions.\nScroll for more detail.",0);
+            }).unwrap();
+            let after = terminal.backend().buffer();
+            let shell_width = width.min(128);
+            let shell_x = (width - shell_width) / 2;
+            let rail_width = if shell_width >= 110 { 28 } else { 23 };
+            let stage_right = shell_x + shell_width - rail_width;
+            let shell_y = (height - height.min(38)) / 2;
+            for y in shell_y + 3..shell_y + height.min(38) - 9 {
+                for x in shell_x..stage_right {
+                    assert_eq!(
+                        before[(x, y)].symbol(),
+                        after[(x, y)].symbol(),
+                        "table cell changed at {width}x{height} ({x},{y})"
+                    );
+                }
+            }
+            let visible = after
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                visible.contains("10"),
+                "hero ten card missing at {width}x{height}"
+            );
+            assert!(
+                visible.contains("SOLVER REVIEW"),
+                "detail pane missing at {width}x{height}"
+            );
+            assert!(
+                visible.contains("GOOD DECISION"),
+                "compact grade missing at {width}x{height}"
+            );
+            assert!(
+                visible.contains("Enter continue"),
+                "continue cue missing at {width}x{height}"
+            );
+            let long_body = format!(
+                "{}\nENDVISIBLE",
+                "A detailed coaching line that wraps in the pane.\n".repeat(40)
+            );
+            terminal
+                .draw(|frame| {
+                    render(frame, &state);
+                    render_coaching_details(frame, " REVIEW ", &long_body, u16::MAX);
+                })
+                .unwrap();
+            let at_end = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                at_end.contains("ENDVISIBLE"),
+                "last explanation line unreachable at {width}x{height}"
+            );
+        }
+    }
+
+    #[test]
     fn shared_pot_is_distinct_from_separate_side_pot_winners() {
         let split = projection(vec![award(41, &[0, 1], &[(0, 21), (1, 20)])], None);
         assert!(rendered(&split, None).contains("SPLIT POT"));
@@ -1475,7 +1722,7 @@ mod tests {
         side.pot_index = 1;
         let side_pots = projection(vec![main, side], None);
         let text = rendered(&side_pots, None);
-        assert!(text.contains("YOU WIN"));
+        assert!(text.contains("YOU WON A POT"));
         assert!(text.contains("You receive 20 chips"));
         assert!(text.contains("Bot 1 receives 60 chips"));
         assert!(!text.contains("SPLIT POT"));

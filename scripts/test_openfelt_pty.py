@@ -119,7 +119,8 @@ with tempfile.TemporaryDirectory(prefix="openfelt-pty-") as root:
     while b"BOOKMARKED" not in ANSI.sub(b"", g.output) and time.monotonic() < deadline:
         g.read(0.1)
     assert b"BOOKMARKED" in ANSI.sub(b"", g.output)
-    g.send("\x1b\x1b")
+    g.send("\x1b")
+    g.send("\x1b")
     assert g.process.poll() is None, "replay must return to the same live session"
     g.quit()
     cash = [json.loads(line) for line in (g.root / "cash-events.jsonl").read_text().splitlines()]
@@ -152,7 +153,7 @@ with tempfile.TemporaryDirectory(prefix="openfelt-pty-") as root:
     g.send("\x1b[C")
     g.send("?")
     g.send("?")
-    g.send("\x1b[B" * 2)
+    g.send("\x1b[B" * 3)
     g.send("\r")
     saved = json.loads((g.root / "settings.json").read_text())
     assert saved["solver_feedback"] is True, "help must preserve the selected setting and draft"
@@ -167,12 +168,63 @@ with tempfile.TemporaryDirectory(prefix="openfelt-pty-") as root:
     g.send("s")
     g.send("\x1b[B" * 6)
     g.send("\x1b[D")
-    g.send("\x1b[B" * 2)
+    g.send("\x1b[B" * 3)
     g.send("\r")
     saved = json.loads((g.root / "settings.json").read_text())
     assert saved["solver_feedback"] is False, "solver preference must persist across restarts"
     g.quit()
     print("PASS: selected-setting help preserves edits; solver On/Off persists across restarts")
+
+    play_root = Path(root) / "play-pace"
+    g = Game(play_root)
+    g.send("s")
+    g.send("\x1b[B" * 7)
+    g.send("?")
+    assert b"Practicepace" in re.sub(rb"\s+", b"", ANSI.sub(b"", g.output))
+    g.send("\x1b")
+    g.send("\x1b[C")
+    g.send("\x1b[B" * 2)
+    g.send("\r")
+    assert json.loads((play_root / "settings.json").read_text())["practice_pace"] == "play"
+    g.send("f")
+    deadline = time.monotonic() + 3
+    while not (play_root / "completed-hands.jsonl").exists() and time.monotonic() < deadline:
+        g.read(0.1)
+    assert (play_root / "completed-hands.jsonl").exists(), "Play must finish without coaching Enter"
+    assert len(g.decisions()) == 1
+    g.send("r")
+    assert b"COMPLETED HANDS" in ANSI.sub(b"", g.output)
+    g.send("\r")
+    g.send("p")
+    assert b"PRACTICE" in ANSI.sub(b"", g.output)
+    for _ in range(3):
+        g.send("1")
+        g.send("\r")
+    drill_stats = json.loads((play_root / "progress.json").read_text())["drills"]
+    assert sum(item["attempts"] for item in drill_stats.values()) == 3
+    g.send("\x1b")
+    g.send("b")
+    assert len(json.loads((play_root / "bookmarks.json").read_text())) == 1
+    g.send("\x1b")
+    g.send("\x1b")
+    g.send("\r")
+    for _ in range(10):
+        g.read(0.5)
+        g.send("c")
+        if len(g.decisions()) >= 2:
+            break
+        # A bot can fold before hero acts; advance that completed hand.
+        g.send("\r")
+    assert len(g.decisions()) >= 2
+    assert json.loads((play_root / "progress.json").read_text())["drills"] == drill_stats, "playing must preserve completed replay drills"
+    g.quit()
+    g = Game(play_root)
+    g.send("f")
+    g.read(0.3)
+    hands = (play_root / "completed-hands.jsonl").read_text().splitlines()
+    assert len(hands) >= 2, "Play preference must survive restart"
+    g.quit()
+    print("PASS: Play pace persists; hand ends without a pause; replay practice returns to bookmark")
 
     # A temporary data directory does not isolate the OS credential store.
     # An empty environment credential fails validation before any Keychain or
@@ -190,7 +242,7 @@ with tempfile.TemporaryDirectory(prefix="openfelt-pty-") as root:
     assert b"OpenAI coaching" in ANSI.sub(b"", g.output)
     g.send("s")
     g.send("\x1b[C" * 2)  # OpenAI -> Anthropic -> Local
-    g.send("\x1b[B" * 8)
+    g.send("\x1b[B" * 9)
     g.send("\r")
     assert json.loads((cloud_root / "settings.json").read_text())["coaching"] == "local"
     g.send("C")

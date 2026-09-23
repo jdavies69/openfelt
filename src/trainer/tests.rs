@@ -527,3 +527,32 @@ fn solver_replay_feedback_rejects_stale_or_resumed_decisions() {
     session.continue_hand();
     assert!(!session.record_solver_feedback(&feedback));
 }
+
+#[test]
+fn background_review_survives_continuation_and_settlement() {
+    let mut session = Session::new_seeded_for_evaluation(Settings::default(), 42).unwrap();
+    at_hero(&mut session);
+    let decision = session.submit(Action::Fold).unwrap().clone();
+    let mut feedback = local_feedback(&decision);
+    feedback.explanation = "Background review fixture".into();
+    session.continue_hand();
+    assert!(session.record_review_feedback(&feedback));
+    for _ in 0..100 {
+        if session.finished() {
+            break;
+        }
+        session.step_bot().unwrap();
+    }
+    assert!(session.finished());
+    feedback.explanation = "Completed hand review fixture".into();
+    assert!(session.record_review_feedback(&feedback));
+    let record = &session.replay_ready[0].decisions[0];
+    assert_eq!(record.feedback, feedback);
+    assert_eq!(record.decision, decision);
+    feedback.evidence_basis = "solver".into();
+    assert!(session.record_review_feedback(&feedback));
+    feedback.evidence_basis = "provider".into();
+    assert!(!session.record_review_feedback(&feedback));
+    feedback.hand_id += 100;
+    assert!(!session.record_review_feedback(&feedback));
+}

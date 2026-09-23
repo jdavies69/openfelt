@@ -232,6 +232,30 @@ impl Session {
         record.feedback = feedback.clone();
         true
     }
+    /// Attach asynchronous review only to its immutable accepted decision.
+    /// Completed snapshots are retained so callers can persist amended reviews.
+    pub fn record_review_feedback(&mut self, feedback: &facts::Feedback) -> bool {
+        let records = self.replay_decisions.iter_mut().chain(
+            self.replay_ready
+                .iter_mut()
+                .flat_map(|hand| hand.decisions.iter_mut()),
+        );
+        for record in records {
+            let observation = &record.decision.observation;
+            if observation.hand_id == feedback.hand_id && observation.revision == feedback.revision
+            {
+                // A prose explanation must never replace an available numerical review.
+                if record.feedback.evidence_basis.starts_with("solver")
+                    && !feedback.evidence_basis.starts_with("solver")
+                {
+                    return false;
+                }
+                record.feedback = feedback.clone();
+                return true;
+            }
+        }
+        false
+    }
     pub fn step_bot(&mut self) -> Result<bool, String> {
         if self.coaching.is_some() || self.finished() {
             return Ok(false);

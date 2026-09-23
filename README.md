@@ -47,13 +47,13 @@ openfelt
 | A | Review an all-in; Enter confirms, Esc cancels |
 | Enter | Submit an amount, continue after teaching, or deal the next hand |
 | ? | Expand teaching details, or show help outside the coaching pause |
-| V | Between hands: browse saved hands and bookmark replay decisions |
-| S | Open settings when the table is not paused for coaching |
+| V / R | Between hands: browse saved hands and review decisions |
+| S | Open settings; press ? for help on the selected setting |
 | B | Between hands: rebuy/top up to 100BB |
 | W | Between hands: withdraw chips with confirmation |
 | Q | Quit at any time |
 
-Letters work in either case. Arrow keys adjust raise entry by one chip. Rejected actions do not count as decisions. Every accepted hero decision freezes the visible pre-decision table and pauses bots until Enter, including folds and all-ins. There is no learner action timer. The hand authority may resolve an immediate runout internally after accepting an action, but no future state reaches the frozen display or coach request.
+Letters work in either case. Arrow keys adjust raise entry by one chip. Rejected actions do not count as decisions. In the default **Learn** pace, every accepted hero decision freezes the visible pre-decision table and pauses bots until Enter, including folds and all-ins. Choose **S → Practice pace → Play → Save and return** to continue immediately and review decisions between hands. The pace persists across launches. Background coaching never holds up Play mode. There is no learner action timer. The hand authority may resolve an immediate runout internally after accepting an action, but no future state reaches the frozen display or coach request.
 
 Blinds stay fixed and rake is off. Busted bots rebuy to preserve the selected seat count. Top-ups and withdrawals are logged separately from completed-hand profit. Quitting mid-hand records decisions already made but does not count the unfinished hand as completed profit; restarting starts a new cash session.
 
@@ -113,7 +113,7 @@ Cloud responses are schema-checked and strategic feedback is labeled heuristic. 
 
 OpenFelt uses the platform local-data folder plus `openfelt` (on macOS, normally `~/Library/Application Support/openfelt`). The in-app Save action or `--save-settings` writes nonsecret settings; decisions, concept counts, completed-hand stats, cash events and provider usage save locally. API keys are excluded from this file. On macOS they prefer local Data Protection internet passwords (no iCloud sync); CLI builds fall back to the login keychain under `dev.openfelt.coaching`. Check Passwords or Keychain Access. On Linux they use Secret Service/keyring; on Windows, Credential Manager. `--data-dir PATH` selects an isolated folder for nonsecret state only. Unix files are created with owner-only permissions. Keep private histories out of public bug reports. There is no automatic upload of history.
 
-Completed hands can be browsed after a restart with `openfelt-replay list`, then `openfelt-replay show HAND_ID --decision 0`. Move forward or backward by changing the zero-based decision number. `openfelt-replay outcome HAND_ID` shows the separately stored final state. `openfelt-replay bookmark HAND_ID DECISION` saves a direct review target; `openfelt-replay bookmarks` lists them. Invalid history lines are skipped and reported without hiding valid hands. Replay decision views contain only the saved pre-decision information.
+Completed hands can be browsed after a restart with `openfelt-replay list`, then `openfelt-replay show HAND_ID --decision 0`. Move forward or backward by changing the zero-based decision number. `openfelt-replay outcome HAND_ID` shows the separately stored final state. `openfelt-replay bookmark HAND_ID DECISION` saves a direct review target; `openfelt-replay bookmarks` lists them. Invalid history lines are skipped and reported without hiding valid hands. Replay decision views contain only the saved pre-decision information. In the in-app replay, review starts at a questionable decision when one exists. Press **P** for a related local practice drill, then return to the same decision. These categorical exercises practice the concept; they are not exact re-solves of the hand. Late background reviews amend the saved hand without duplicating it.
 
 Run `openfelt-eval` for the committed, reproducible offline coaching corpus and rubric report. It makes no provider calls. `--live` requires an API key plus explicit model, request count, and budget, but live adapter execution remains disabled until reviewed scenario decisions and dated price inputs are supplied. Offline fixture success does not establish live teaching quality.
 

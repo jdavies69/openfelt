@@ -168,11 +168,18 @@ pub fn feedback(d: &Decision) -> Feedback {
             TablePosition::SmallBlind => PreflopBand::Open,
             TablePosition::BigBlind => PreflopBand::LateOpen,
         };
+        let position = match pos {
+            TablePosition::Early => "early position",
+            TablePosition::Middle => "middle position",
+            TablePosition::Late => "late position",
+            TablePosition::SmallBlind => "the small blind",
+            TablePosition::BigBlind => "the big blind",
+        };
         match (band >= required, action) {
-            (true, "raise") => ("reasonable", "Preflop position-aware opening", format!("This hand clears the trainer's {:?} opening threshold from {:?}. Raising first-in applies pressure and avoids entering passively.", required, pos), None),
-            (false, "fold") => ("reasonable", "Preflop position-aware opening", format!("This hand falls below the trainer's {:?} opening threshold from {:?}. Later seats may open more hands because fewer players remain.", required, pos), None),
-            (false, "call" | "raise" | "all-in") => ("reconsider", "Preflop position-aware opening", format!("This hand falls below the trainer's {:?} opening threshold from {:?}. Entering needs a table-specific reason this heuristic cannot observe.", required, pos), Some("fold".into())),
-            _ => ("uncertain", "Preflop position-aware opening", format!("This hand meets the trainer's {:?} threshold from {:?}, but the accepted {} does not clearly express a first-in value plan.", required, pos, action), if o.legal.min_raise_to.is_some(){Some("raise".into())}else{None}),
+            (true, "raise") => ("reasonable", "Preflop position-aware opening", format!("Raising is a reasonable way to enter an unopened pot with this hand from {position}. The local guide favors playing it for a raise."), None),
+            (false, "fold") => ("reasonable", "Preflop position-aware opening", format!("Folding saves chips with a hand the local guide usually folds from {position}. You can play more hands when fewer players remain behind you."), None),
+            (false, "call" | "raise" | "all-in") => ("reconsider", "Preflop position-aware opening", format!("Consider folding: the local guide treats this hand as too weak to enter from {position}. A specific read on your opponents could change that advice."), Some("fold".into())),
+            _ => ("uncertain", "Preflop position-aware opening", format!("Consider raising: the local guide includes this hand among those to open from {position}. It cannot confidently judge your {action} without knowing your opponents."), if o.legal.min_raise_to.is_some(){Some("raise".into())}else{None}),
         }
     };
     Feedback {
