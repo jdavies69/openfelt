@@ -171,12 +171,15 @@ fn ip_exact_bet_after_public_check_produces_solver_feedback() {
     live_solver::eligibility(&ip_facing_bet).unwrap();
 
     let mut oop_facing_raise = ip_facing_bet;
-    oop_facing_raise.observation.public_history.push(PublicAction {
-        phase: MultiwayPhase::River,
-        seat: seat(1),
-        action: Action::Raise(60),
-        wager_after: 60,
-    });
+    oop_facing_raise
+        .observation
+        .public_history
+        .push(PublicAction {
+            phase: MultiwayPhase::River,
+            seat: seat(1),
+            action: Action::Raise(60),
+            wager_after: 60,
+        });
     oop_facing_raise.observation.history = oop_facing_raise
         .observation
         .public_history
