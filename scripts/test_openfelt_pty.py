@@ -144,8 +144,9 @@ with tempfile.TemporaryDirectory(prefix="openfelt-pty-") as root:
     g.send("s")
     g.send("\x1b[B" * 6)
     g.send("?")
-    assert b"SETTINGS HELP" in ANSI.sub(b"", g.output)
-    assert b"Solver feedback" in ANSI.sub(b"", g.output)
+    help_text = re.sub(rb"\s+", b"", ANSI.sub(b"", g.output))
+    assert b"SETTINGSHELP" in help_text
+    assert b"Solverfeedback" in help_text
     g.send("\x1b")
     g.send("\x1b[C")
     g.send("?")
