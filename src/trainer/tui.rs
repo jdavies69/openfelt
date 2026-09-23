@@ -139,10 +139,7 @@ pub fn run(
     first_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let progress = store.progress()?;
-    let consent = matches!(
-        settings.coaching,
-        CoachingMode::Openai | CoachingMode::Anthropic
-    );
+    let consent = requires_cloud_consent(settings.coaching);
     let mut ui = Ui {
         session: Session::new(settings)?,
         input: Input::Play,
@@ -476,12 +473,8 @@ pub fn run(
                     }) {
                         Ok(()) => {
                             if ui.first_run {
-                                ui.session =
-                                    Session::new(editor.draft.clone()).expect("validated settings");
-                                ui.consent = matches!(
-                                    editor.draft.coaching,
-                                    CoachingMode::Openai | CoachingMode::Anthropic
-                                );
+                                apply_saved_settings(&mut ui, editor.draft.clone(), true)
+                                    .expect("validated settings");
                                 ui.first_run = false;
                                 ui.status = if editor.key.is_empty() {
                                     "Setup saved; local table is ready".into()
@@ -492,9 +485,18 @@ pub fn run(
                                     )
                                 };
                             } else {
-                                ui.session.settings = editor.draft.clone();
+                                apply_saved_settings(&mut ui, editor.draft.clone(), false)
+                                    .expect("validated settings");
                                 ui.status = if editor.key.is_empty() {
-                                    "Settings saved; table changes apply next session".into()
+                                    if ui.consent {
+                                        "Settings saved; approve cloud coaching for this session"
+                                            .into()
+                                    } else {
+                                        format!(
+                                            "Settings saved; {} active",
+                                            active_coaching_label(&ui)
+                                        )
+                                    }
                                 } else {
                                     format!(
                                         "Settings and API key saved. {}",
@@ -545,14 +547,10 @@ pub fn run(
         if ui.consent {
             match code {
                 KeyCode::Enter => {
-                    ui.consent = false;
-                    ui.cloud_enabled = true;
-                    ui.status="Cloud coaching enabled for this session · optional calls may incur provider charges".into();
+                    accept_cloud_for_session(&mut ui);
                 }
                 KeyCode::Esc | KeyCode::Char('l') => {
-                    ui.consent = false;
-                    ui.session.settings.coaching = CoachingMode::Local;
-                    ui.status = "Local teaching · no network requests".into();
+                    skip_cloud_for_session(&mut ui);
                 }
                 _ => {}
             }
@@ -781,6 +779,64 @@ pub fn run(
         );
     }
     Ok(())
+}
+
+fn apply_saved_settings(
+    ui: &mut Ui,
+    settings: Settings,
+    reset_session: bool,
+) -> Result<(), String> {
+    let same_cloud_target = ui.session.settings.coaching == settings.coaching
+        && ui.session.settings.cloud.model == settings.cloud.model;
+    let keep_cloud_enabled = !reset_session && ui.cloud_enabled && same_cloud_target;
+    if reset_session {
+        ui.session = Session::new(settings)?;
+    } else {
+        ui.session.settings = settings;
+    }
+    ui.cloud_enabled = keep_cloud_enabled;
+    ui.consent = selected_provider(ui.session.settings.coaching).is_some() && !keep_cloud_enabled;
+    ui.pending = None;
+    ui.provider_feedback = false;
+    Ok(())
+}
+
+fn requires_cloud_consent(mode: CoachingMode) -> bool {
+    selected_provider(mode).is_some()
+}
+
+fn accept_cloud_for_session(ui: &mut Ui) {
+    ui.consent = false;
+    ui.cloud_enabled = true;
+    ui.status =
+        "Cloud coaching enabled for this session · optional calls may incur provider charges"
+            .into();
+}
+
+fn skip_cloud_for_session(ui: &mut Ui) {
+    ui.consent = false;
+    ui.cloud_enabled = false;
+    let saved = selected_provider(ui.session.settings.coaching)
+        .map(provider_label)
+        .unwrap_or("cloud");
+    ui.status =
+        format!("Local coaching this session · {saved} remains selected · no network requests");
+}
+
+fn active_coaching_label(ui: &Ui) -> String {
+    match selected_provider(ui.session.settings.coaching) {
+        Some(provider) if ui.cloud_enabled => format!("{} coaching", provider_label(provider)),
+        Some(provider) => format!("local · {} selected", provider_label(provider)),
+        None if ui.session.settings.coaching == CoachingMode::Off => "coaching off".into(),
+        None => "local coaching".into(),
+    }
+}
+
+fn provider_label(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Openai => "OpenAI",
+        Provider::Anthropic => "Anthropic",
+    }
 }
 
 fn scroll_deep(scroll: &mut u16, code: KeyCode) -> bool {
@@ -1239,6 +1295,7 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
         ui.provider_feedback,
         ui.pending.is_some(),
     );
+    let active_coaching = active_coaching_label(ui);
     super::table_ui::render(
         frame,
         &super::table_ui::TableRenderState {
@@ -1254,6 +1311,7 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
             hand_label: hand_label.as_deref(),
             review_tone,
             guidance_source,
+            active_coaching: &active_coaching,
         },
     );
 
@@ -1525,6 +1583,91 @@ mod tests {
         cloud_ui.consent = true;
         assert!(cloud_ui.credentials.openai.is_none());
         assert!(cloud_ui.credentials.anthropic.is_none());
+    }
+
+    #[test]
+    fn saved_cloud_provider_survives_skip_save_and_relaunch_without_key_access() {
+        let mut ui = ui(2);
+        let mut saved = ui.session.settings.clone();
+        saved.coaching = CoachingMode::Openai;
+        saved.cloud.model = "gpt-5.4-nano".into();
+
+        apply_saved_settings(&mut ui, saved.clone(), false).unwrap();
+        assert!(ui.consent);
+        assert!(!ui.cloud_enabled);
+        assert_eq!(ui.session.settings.coaching, CoachingMode::Openai);
+        assert_eq!(active_coaching_label(&ui), "local · OpenAI selected");
+        assert!(ui.credentials.openai.is_none());
+
+        skip_cloud_for_session(&mut ui);
+        assert!(!ui.consent && !ui.cloud_enabled);
+        assert_eq!(ui.session.settings.coaching, CoachingMode::Openai);
+        assert!(ui.status.contains("OpenAI remains selected"));
+        assert!(requires_cloud_consent(saved.coaching));
+
+        apply_saved_settings(&mut ui, saved.clone(), false).unwrap();
+        assert!(ui.consent, "saving while local asks before enabling cloud");
+        accept_cloud_for_session(&mut ui);
+        assert_eq!(active_coaching_label(&ui), "OpenAI coaching");
+        assert!(
+            ui.credentials.openai.is_none(),
+            "consent does not read a key"
+        );
+
+        let mut unrelated = saved;
+        unrelated.seats = 3;
+        apply_saved_settings(&mut ui, unrelated, false).unwrap();
+        assert!(
+            ui.cloud_enabled,
+            "unrelated settings preserve session consent"
+        );
+        assert!(!ui.consent);
+    }
+
+    #[test]
+    fn unrelated_settings_save_roundtrips_the_selected_cloud_provider_after_skip() {
+        let root = std::env::temp_dir().join(format!(
+            "openfelt-provider-persistence-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let store = Store { root: root.clone() };
+        let mut saved = Settings {
+            coaching: CoachingMode::Openai,
+            ..Settings::default()
+        };
+        store.save("settings.json", &saved).unwrap();
+
+        let mut ui = ui(2);
+        apply_saved_settings(&mut ui, store.settings().unwrap(), false).unwrap();
+        skip_cloud_for_session(&mut ui);
+        saved.seats = 3;
+        apply_saved_settings(&mut ui, saved.clone(), false).unwrap();
+        store.save("settings.json", &ui.session.settings).unwrap();
+
+        let reloaded = store.settings().unwrap();
+        assert_eq!(reloaded.coaching, CoachingMode::Openai);
+        assert_eq!(reloaded.seats, 3);
+        assert!(requires_cloud_consent(reloaded.coaching));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changing_cloud_destination_requires_fresh_consent_without_resolving_a_key() {
+        let mut ui = ui(2);
+        let mut openai = ui.session.settings.clone();
+        openai.coaching = CoachingMode::Openai;
+        apply_saved_settings(&mut ui, openai, false).unwrap();
+        accept_cloud_for_session(&mut ui);
+
+        let mut anthropic = ui.session.settings.clone();
+        anthropic.coaching = CoachingMode::Anthropic;
+        anthropic.cloud.model = "claude-sonnet-4-5".into();
+        apply_saved_settings(&mut ui, anthropic, false).unwrap();
+        assert!(ui.consent);
+        assert!(!ui.cloud_enabled);
+        assert!(ui.credentials.openai.is_none());
+        assert!(ui.credentials.anthropic.is_none());
     }
 
     #[test]
