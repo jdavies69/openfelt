@@ -472,3 +472,87 @@ fn short_all_in_does_not_reopen_hero_raise() {
     assert!(s.coaching.is_none());
     s.submit(Action::Call(4)).unwrap();
 }
+
+#[test]
+fn public_street_history_is_predecision_and_old_records_still_load() {
+    let mut session = Session::new(Settings {
+        seats: 2,
+        ..Settings::default()
+    })
+    .unwrap();
+    at_hero(&mut session);
+    let action = session.observation(hero()).unwrap().check_call();
+    let decision = session.submit(action).unwrap().clone();
+    assert_eq!(
+        decision.observation.public_history.len() as u64,
+        decision.observation.revision
+    );
+    assert_eq!(
+        session.hand.action_history.len(),
+        decision.observation.public_history.len() + 1
+    );
+    for (public, engine) in decision
+        .observation
+        .public_history
+        .iter()
+        .zip(&session.hand.action_history)
+    {
+        assert_eq!(public.phase, engine.phase);
+        assert_eq!(public.seat, engine.seat);
+        assert_eq!(public.action, engine.action);
+        assert_eq!(public.wager_after, engine.wager_after);
+    }
+    let mut old_record = serde_json::to_value(&decision).unwrap();
+    old_record["observation"]
+        .as_object_mut()
+        .unwrap()
+        .remove("public_history");
+    let restored: Decision = serde_json::from_value(old_record).unwrap();
+    assert!(restored.observation.public_history.is_empty());
+}
+
+#[test]
+fn solver_replay_feedback_rejects_stale_or_resumed_decisions() {
+    let mut session = Session::new(Settings::default()).unwrap();
+    at_hero(&mut session);
+    let action = session.observation(hero()).unwrap().check_call();
+    let decision = session.submit(action).unwrap().clone();
+    let mut feedback = local_feedback(&decision);
+    feedback.evidence_basis = "solver: test fixture".into();
+    feedback.revision += 1;
+    assert!(!session.record_solver_feedback(&feedback));
+    feedback.revision -= 1;
+    assert!(session.record_solver_feedback(&feedback));
+    assert_eq!(session.replay_decisions.last().unwrap().feedback, feedback);
+    session.continue_hand();
+    assert!(!session.record_solver_feedback(&feedback));
+}
+
+#[test]
+fn background_review_survives_continuation_and_settlement() {
+    let mut session = Session::new_seeded_for_evaluation(Settings::default(), 42).unwrap();
+    at_hero(&mut session);
+    let decision = session.submit(Action::Fold).unwrap().clone();
+    let mut feedback = local_feedback(&decision);
+    feedback.explanation = "Background review fixture".into();
+    session.continue_hand();
+    assert!(session.record_review_feedback(&feedback));
+    for _ in 0..100 {
+        if session.finished() {
+            break;
+        }
+        session.step_bot().unwrap();
+    }
+    assert!(session.finished());
+    feedback.explanation = "Completed hand review fixture".into();
+    assert!(session.record_review_feedback(&feedback));
+    let record = &session.replay_ready[0].decisions[0];
+    assert_eq!(record.feedback, feedback);
+    assert_eq!(record.decision, decision);
+    feedback.evidence_basis = "solver".into();
+    assert!(session.record_review_feedback(&feedback));
+    feedback.evidence_basis = "provider".into();
+    assert!(!session.record_review_feedback(&feedback));
+    feedback.hand_id += 100;
+    assert!(!session.record_review_feedback(&feedback));
+}

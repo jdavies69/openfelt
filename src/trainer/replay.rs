@@ -61,7 +61,14 @@ impl Archive {
                                     .iter()
                                     .all(|d| d.decision.observation.hand_id == hand.sequence) =>
                         {
-                            archive.hands.push(hand)
+                            if let Some(existing) = archive.hands.iter_mut().find(|existing| {
+                                existing.session_id == hand.session_id
+                                    && existing.hand_id == hand.hand_id
+                            }) {
+                                *existing = hand;
+                            } else {
+                                archive.hands.push(hand);
+                            }
                         }
                         _ => archive.skipped_records += 1,
                     }
@@ -147,6 +154,27 @@ mod tests {
         }
         assert!(session.finished());
         session.replay_ready.remove(0)
+    }
+
+    #[test]
+    fn amended_completed_reviews_replace_snapshot_without_duplicate_hands() {
+        let root = temp_root("amended");
+        let original = play_seeded(42);
+        let mut amended = original.clone();
+        assert!(!amended.decisions.is_empty());
+        amended.decisions[0].feedback.explanation = "Late background review".into();
+        fs::write(
+            root.join("completed-hands.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&original).unwrap(),
+                serde_json::to_string(&amended).unwrap()
+            ),
+        )
+        .unwrap();
+        let archive = Archive::load(&root).unwrap();
+        assert_eq!(archive.hands, vec![amended]);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

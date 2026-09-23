@@ -2,7 +2,7 @@
 
 > Play the hand. Learn the game.
 
-A public, MIT-licensed, local play-money No-Limit Texas Hold’em trainer. Start with six seats, 100 big blinds, heuristic opponents and short teaching after each decision. No account, subscription, API key or hosted service is required to play.
+A public, open-source, local play-money No-Limit Texas Hold’em trainer. Start with six seats, 100 big blinds, heuristic opponents and short teaching after each decision. No account, subscription, API key or hosted service is required to play. The combined application includes an AGPL-3.0-or-later solver; see [licensing and source](THIRD_PARTY_NOTICES.md).
 
 ## Run locally
 
@@ -47,13 +47,13 @@ openfelt
 | A | Review an all-in; Enter confirms, Esc cancels |
 | Enter | Submit an amount, continue after teaching, or deal the next hand |
 | ? | Expand teaching details, or show help outside the coaching pause |
-| V | Between hands: browse saved hands and bookmark replay decisions |
-| S | Open settings when the table is not paused for coaching |
+| V / R | Between hands: browse saved hands and review decisions |
+| S | Open settings; press ? for help on the selected setting |
 | B | Between hands: rebuy/top up to 100BB |
 | W | Between hands: withdraw chips with confirmation |
 | Q | Quit at any time |
 
-Letters work in either case. Arrow keys adjust raise entry by one chip. Rejected actions do not count as decisions. Every accepted hero decision freezes the visible pre-decision table and pauses bots until Enter, including folds and all-ins. There is no learner action timer. The hand authority may resolve an immediate runout internally after accepting an action, but no future state reaches the frozen display or coach request.
+Letters work in either case. Arrow keys adjust raise entry by one chip. Rejected actions do not count as decisions. In the default **Learn** pace, every accepted hero decision freezes the visible pre-decision table and pauses bots until Enter, including folds and all-ins. Choose **S → Practice pace → Play → Save and return** to continue immediately and review decisions between hands. The pace persists across launches. Background coaching never holds up Play mode. There is no learner action timer. The hand authority may resolve an immediate runout internally after accepting an action, but no future state reaches the frozen display or coach request.
 
 Blinds stay fixed and rake is off. Busted bots rebuy to preserve the selected seat count. Top-ups and withdrawals are logged separately from completed-hand profit. Quitting mid-hand records decisions already made but does not count the unfinished hand as completed profit; restarting starts a new cash session.
 
@@ -89,7 +89,7 @@ openfelt --coaching openai --model YOUR_MODEL_ID --max-requests 30 --max-output-
 openfelt --coaching anthropic --model YOUR_MODEL_ID --max-requests 30 --max-output-tokens 600
 ```
 
-The app displays the selected provider and asks you to enable cloud coaching for the current session. Choosing local coaching for one session leaves the saved provider preference unchanged, so Settings and the next launch still show the provider you selected. Saving a different cloud provider or model asks for session consent again; changing unrelated table settings preserves consent already granted for that session. It sends only the allowlisted pre-decision player view, accepted action and calculated facts. The key goes only in the authentication header, never in the prompt, settings, history, or logs. No validation request is sent merely because a key is present or saved. Enter at the coaching pause cancels the request and continues; T explicitly retries and may incur another charge. Q cancels and quits. There are no automatic retries, provider fallbacks, telemetry or project proxy.
+The selected provider stays active across launches. Save OpenAI or Anthropic with your key once; coaching requests start automatically after accepted decisions, within your configured limits. Select Local or Off to stop cloud coaching. There is no separate per-session enable prompt. It sends only the allowlisted pre-decision player view, accepted action and calculated facts. The key goes only in the authentication header, never in the prompt, settings, history, or logs. No validation request is sent merely because a key is present or saved. Enter at the coaching pause cancels the request and continues; T explicitly retries and may incur another charge. Q cancels and quits. There are no automatic retries, provider fallbacks, telemetry or project proxy.
 
 Credential precedence is the selected provider's environment variable, its keychain entry, then no cloud credential. Nonsecret CLI options override saved settings. OpenAI and Anthropic use separate credential accounts. On macOS, Save prefers a **local** Data Protection internet password (`kSecUseDataProtectionKeychain`, synchronizable = false — no iCloud sync) for `api.openai.com` / `api.anthropic.com`. CLI and unsigned builds often lack that entitlement, so Save falls back to the login keychain generic item under service `dev.openfelt.coaching` (Keychain Access). Older generic items are still read and removed when a Data Protection save succeeds. On Windows and Linux the OS credential manager / Secret Service is unchanged. Forgetting one provider never exposes or reuses it for the other. API keys are deliberately not accepted as command-line arguments because process listings and shell history can expose them. Custom endpoints, OpenAI-compatible services, and local-model adapters are outside this feature.
 
@@ -113,9 +113,25 @@ Cloud responses are schema-checked and strategic feedback is labeled heuristic. 
 
 OpenFelt uses the platform local-data folder plus `openfelt` (on macOS, normally `~/Library/Application Support/openfelt`). The in-app Save action or `--save-settings` writes nonsecret settings; decisions, concept counts, completed-hand stats, cash events and provider usage save locally. API keys are excluded from this file. On macOS they prefer local Data Protection internet passwords (no iCloud sync); CLI builds fall back to the login keychain under `dev.openfelt.coaching`. Check Passwords or Keychain Access. On Linux they use Secret Service/keyring; on Windows, Credential Manager. `--data-dir PATH` selects an isolated folder for nonsecret state only. Unix files are created with owner-only permissions. Keep private histories out of public bug reports. There is no automatic upload of history.
 
-Completed hands can be browsed after a restart with `openfelt-replay list`, then `openfelt-replay show HAND_ID --decision 0`. Move forward or backward by changing the zero-based decision number. `openfelt-replay outcome HAND_ID` shows the separately stored final state. `openfelt-replay bookmark HAND_ID DECISION` saves a direct review target; `openfelt-replay bookmarks` lists them. Invalid history lines are skipped and reported without hiding valid hands. Replay decision views contain only the saved pre-decision information.
+Completed hands can be browsed after a restart with `openfelt-replay list`, then `openfelt-replay show HAND_ID --decision 0`. Move forward or backward by changing the zero-based decision number. `openfelt-replay outcome HAND_ID` shows the separately stored final state. `openfelt-replay bookmark HAND_ID DECISION` saves a direct review target; `openfelt-replay bookmarks` lists them. Invalid history lines are skipped and reported without hiding valid hands. Replay decision views contain only the saved pre-decision information. In the in-app replay, review starts at a questionable decision when one exists. Press **P** for a related local practice drill, then return to the same decision. These categorical exercises practice the concept; they are not exact re-solves of the hand. Late background reviews amend the saved hand without duplicating it.
 
 Run `openfelt-eval` for the committed, reproducible offline coaching corpus and rubric report. It makes no provider calls. `--live` requires an API key plus explicit model, request count, and budget, but live adapter execution remains disabled until reviewed scenario decisions and dated price inputs are supplied. Offline fixture success does not establish live teaching quality.
+
+## Local solver practice
+
+For feedback while playing, open **S → Solver feedback → On → Save and return**.
+The setting persists. Supported heads-up river decisions are reviewed locally in
+the normal post-decision panel with **Solver · modeled ranges** feedback. Other
+spots retain labeled heuristic teaching. See [live feedback and its assumptions](docs/solver/live-feedback.md).
+
+Run `openfelt --solver-practice`, or press **G** at the trainer table, for a
+heads-up river exercise with explicit hand ranges and betting options. Choose an
+action to see estimated EV loss and strategy frequency immediately after the
+local solve completes. No model or API key is involved. Custom weighted ranges
+and sizes can be supplied with `--solver-scenario path/to/scenario.json`.
+
+See [river practice and scenario format](docs/solver/README.md). The separate
+practice mode accepts custom scenarios; regular multiway play still uses heuristic coaching.
 
 ## Development and provenance
 
@@ -126,7 +142,9 @@ cargo test --locked --all-targets --all-features
 cargo build --locked --release --bin openfelt --bin sneakyblinders --bin poker-server
 ```
 
-On macOS/Linux, also run `python3 scripts/test_openfelt_pty.py target/release/openfelt` for real terminal input/resize/restart checks.
+On macOS/Linux, also run `python3 scripts/test_openfelt_pty.py target/release/openfelt`
+and `python3 scripts/test_solver_pty.py target/release/openfelt` for real terminal
+input, resize, restart and solver-practice checks.
 
 No model key is needed for tests. Provider tests run artificial localhost servers; some environments need localhost permission. New trainer code lives under `src/trainer/`; the engine and original binary targets remain available. Package registry publication is disabled until OpenFelt distribution metadata is deliberately prepared. Do not reuse inherited release tags/workflows without reviewing their upstream-specific distribution settings.
 

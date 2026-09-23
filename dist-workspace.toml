@@ -3,6 +3,8 @@ members = ["cargo:."]
 
 # Config for 'dist'
 [dist]
+include = ["LICENSE", "LICENSE-MIT", "LICENSE-AGPL", "THIRD_PARTY_NOTICES.md"]
+source-tarball = true
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.30.3"
 # CI backends to support

@@ -22,6 +22,15 @@ pub struct PublicSeat {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct PublicAction {
+    pub phase: MultiwayPhase,
+    pub seat: SeatId,
+    pub action: Action,
+    pub wager_after: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Observation {
     pub hand_id: u64,
     pub revision: u64,
@@ -38,6 +47,9 @@ pub struct Observation {
     pub wager: u32,
     pub legal: MultiwayLegalActions,
     pub history: Vec<(SeatId, Action)>,
+    /// Street-aware public actions before this decision; absent in older records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub public_history: Vec<PublicAction>,
 }
 impl Observation {
     pub fn from_projection(
@@ -86,6 +98,7 @@ impl Observation {
             wager: p.current_wager,
             legal: p.legal_actions.clone().ok_or("Missing legal actions")?,
             history,
+            public_history: Vec::new(),
         })
     }
     pub fn own(&self) -> &PublicSeat {

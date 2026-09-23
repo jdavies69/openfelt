@@ -46,3 +46,6 @@ jobs:
       - name: Exercise OpenFelt in a terminal
         if: runner.os != 'Windows'
         run: python3 scripts/test_openfelt_pty.py target/release/openfelt
+      - name: Exercise local solver practice in a terminal
+        if: runner.os != 'Windows'
+        run: python3 scripts/test_solver_pty.py target/release/openfelt

@@ -1,0 +1,13 @@
+{
+  "id": "river_overpairs",
+  "title": "River overpairs and missed draws",
+  "description": "A small teaching model with explicit weighted ranges, not inferred opponent holdings.",
+  "board": ["2s", "3h", "4d", "6c", "7s"],
+  "hero_range": "AsAh,QsQh,JsJh,AcKc:0.5,AdKd:0.5",
+  "villain_range": "KsKh,QcJc,QdJd,Ts9s:0.5,Th9h:0.5",
+  "pot": 100,
+  "effective_stack": 100,
+  "oop": true,
+  "bet_sizes": [0.5],
+  "raise_sizes": [2.5]
+}

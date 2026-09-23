@@ -1,13 +1,14 @@
 # Open-source and bring-your-own-key requirements
 
 Status: approved product direction; implementation pending.
-Updated September 21, 2026.
+Updated September 23, 2026: the approved solver integration changes the combined
+application's license to AGPL-3.0-or-later while preserving original MIT notices.
 
 ## Public project and release scope
 
 - Use a public `jdavies69/openfelt` repository. Retain the upstream MIT license
-  and copyright, and document project provenance. License new project code under
-  MIT with clear contributor terms. Do not imply project affiliation with the
+  and copyright in LICENSE-MIT, and document project provenance. License new project code under
+  AGPL-3.0-or-later with clear contributor terms. Do not imply project affiliation with the
   original author or redistribute third-party assets without checking their terms.
 - Anyone can obtain source and build it without joining the maintainer's accounts.
   Document macOS, Linux and Windows behavior honestly against actual test results.

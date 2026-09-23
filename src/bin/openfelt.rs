@@ -3,6 +3,8 @@ use terminal_poker::trainer::{
     drills::{self, DrillTopic},
     policy::{Difficulty, Profile, Style},
     replay,
+    solver::RiverScenario,
+    solver_ui,
     storage::{CoachingMode, Store},
     tui,
 };
@@ -64,9 +66,34 @@ struct Args {
     /// Run a three-question offline practice set and exit.
     #[arg(long, value_enum)]
     drill: Option<DrillTopic>,
+    /// Practice a local heads-up river decision against explicit ranges and bet sizes.
+    #[arg(long)]
+    solver_practice: bool,
+    /// JSON scenario file for river practice; implies --solver-practice.
+    #[arg(long)]
+    solver_scenario: Option<std::path::PathBuf>,
+    /// Show application licenses, third-party notices, and public source.
+    #[arg(long)]
+    license: bool,
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if args.license {
+        println!("OpenFelt combined application: AGPL-3.0-or-later.\nOriginal terminal-poker material: MIT; original copyright and license are preserved.\nFull terms: LICENSE, LICENSE-AGPL, LICENSE-MIT, THIRD_PARTY_NOTICES.md.\nCorresponding source: https://github.com/jdavies69/openfelt");
+        return Ok(());
+    }
+    if args.solver_practice || args.solver_scenario.is_some() {
+        let scenario = args
+            .solver_scenario
+            .as_ref()
+            .map(
+                |path| -> Result<RiverScenario, Box<dyn std::error::Error>> {
+                    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+                },
+            )
+            .transpose()?;
+        return solver_ui::run(scenario);
+    }
     let explicit_setup = args.seats.is_some()
         || args.small_blind.is_some()
         || args.big_blind.is_some()

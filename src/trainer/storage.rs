@@ -19,7 +19,18 @@ pub struct Settings {
     pub big_blind: u32,
     pub opponents: PolicySettings,
     pub coaching: CoachingMode,
+    /// Opt-in local solver feedback for supported heads-up river decisions.
+    pub solver_feedback: bool,
+    /// Learn pauses after each decision; Play continues and reviews at hand end.
+    pub practice_pace: PracticePace,
     pub cloud: super::provider::ProviderSettings,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PracticePace {
+    #[default]
+    Learn,
+    Play,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum, Default)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +49,8 @@ impl Default for Settings {
             big_blind: 2,
             opponents: PolicySettings::default(),
             coaching: CoachingMode::Local,
+            solver_feedback: false,
+            practice_pace: PracticePace::Learn,
             cloud: super::provider::ProviderSettings::default(),
         }
     }
@@ -179,4 +192,23 @@ fn private_file(path: &Path, append: bool) -> Result<fs::File, String> {
     options
         .open(path)
         .map_err(|_| "Cannot open private state file".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PracticePace, Settings};
+
+    #[test]
+    fn solver_feedback_defaults_off_for_existing_settings_and_roundtrips() {
+        let old = serde_json::json!({"seats": 2, "small_blind": 1, "big_blind": 2});
+        let mut settings: Settings = serde_json::from_value(old).unwrap();
+        assert!(!settings.solver_feedback);
+        assert_eq!(settings.practice_pace, PracticePace::Learn);
+        settings.solver_feedback = true;
+        settings.practice_pace = PracticePace::Play;
+        let saved = serde_json::to_string(&settings).unwrap();
+        let reloaded = serde_json::from_str::<Settings>(&saved).unwrap();
+        assert!(reloaded.solver_feedback);
+        assert_eq!(reloaded.practice_pace, PracticePace::Play);
+    }
 }

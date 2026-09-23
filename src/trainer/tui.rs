@@ -1,8 +1,8 @@
 use super::{
     facts::{local_feedback, Feedback},
-    hero,
+    hero, live_solver,
     provider::{self, CredentialTest, Pending, Provider, SystemKeyring, Usage},
-    storage::{CoachingMode, Progress, Settings, Store},
+    storage::{CoachingMode, PracticePace, Progress, Settings, Store},
     update::{self, AvailableUpdate, UpdateDone, UpdateMessage},
     Session,
 };
@@ -20,8 +20,63 @@ use ratatui::{
 };
 use std::{
     io,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+        Arc, Mutex,
+    },
+    thread,
     time::{Duration, Instant},
 };
+
+struct PendingSolver {
+    hand_id: u64,
+    revision: u64,
+    cancel: Arc<AtomicBool>,
+    result: Receiver<Result<Feedback, String>>,
+}
+static LIVE_SOLVER_GATE: Mutex<()> = Mutex::new(());
+impl PendingSolver {
+    fn start(decision: super::facts::Decision) -> Self {
+        let hand_id = decision.observation.hand_id;
+        let revision = decision.observation.revision;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (sender, result) = mpsc::channel();
+        thread::spawn(move || {
+            let _gate = LIVE_SOLVER_GATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let response = if worker_cancel.load(Ordering::Relaxed) {
+                Err("Solver cancelled".into())
+            } else {
+                live_solver::solve_decision(&decision, &worker_cancel)
+            };
+            let _ = sender.send(response);
+        });
+        Self {
+            hand_id,
+            revision,
+            cancel,
+            result,
+        }
+    }
+    fn poll(&self) -> Option<Result<Feedback, String>> {
+        match self.result.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(Err("Solver worker stopped".into())),
+        }
+    }
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+impl Drop for PendingSolver {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
 
 enum Input {
     Play,
@@ -41,8 +96,22 @@ struct SettingsEditor {
     update_note: String,
     update_offer: Option<AvailableUpdate>,
     confirm_install: bool,
+    help: bool,
 }
 impl SettingsEditor {
+    fn handle_help_key(&mut self, code: KeyCode) -> bool {
+        if self.help {
+            if matches!(code, KeyCode::Esc | KeyCode::Char('?')) {
+                self.help = false;
+            }
+            return true;
+        }
+        if code == KeyCode::Char('?') {
+            self.help = true;
+            return true;
+        }
+        false
+    }
     fn switch_provider(&mut self, coaching: CoachingMode, source: String) {
         self.draft.coaching = coaching;
         self.source = source;
@@ -109,12 +178,18 @@ struct Ui {
     session: Session,
     input: Input,
     feedback: Option<Feedback>,
+    baseline_feedback: Option<Feedback>,
+    solver_pending: Option<PendingSolver>,
+    background_solvers: Vec<PendingSolver>,
+    solver_feedback: bool,
+    solver_note: Option<String>,
     pending: Option<Pending>,
+    pending_decision: Option<super::facts::Decision>,
+    background_pending: Vec<(super::facts::Decision, Pending)>,
     status: String,
     deep: bool,
     deep_scroll: u16,
     help: bool,
-    consent: bool,
     cloud_enabled: bool,
     provider_feedback: bool,
     usage: Usage,
@@ -122,8 +197,10 @@ struct Ui {
     accounted_hands: u64,
     accounted_profit: i64,
     cash_saved: usize,
-    replay_saved: usize,
+    replay_snapshots: Vec<Vec<u8>>,
+    review_changed: bool,
     replay: Option<super::replay_ui::ReplayUi>,
+    solver: Option<super::solver_ui::SolverUi>,
     saved_progress: Vec<u8>,
     settings: Option<SettingsEditor>,
     credential_test: Option<CredentialTest>,
@@ -139,26 +216,34 @@ pub fn run(
     first_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let progress = store.progress()?;
-    let consent = requires_cloud_consent(settings.coaching);
+    let cloud_enabled = selected_provider(settings.coaching).is_some();
     let mut ui = Ui {
         session: Session::new(settings)?,
         input: Input::Play,
         feedback: None,
+        baseline_feedback: None,
+        solver_pending: None,
+        background_solvers: Vec::new(),
+        solver_feedback: false,
+        solver_note: None,
         pending: None,
-        status: "F fold · C check/call · R raise · A all-in · ? help".into(),
+        pending_decision: None,
+        background_pending: Vec::new(),
+        status: "F fold · C check/call · R raise · A all-in · G river practice · ? help".into(),
         deep: false,
         deep_scroll: 0,
         help: false,
-        consent,
-        cloud_enabled: false,
+        cloud_enabled,
         provider_feedback: false,
         usage: Usage::default(),
         progress,
         accounted_hands: 0,
         accounted_profit: 0,
         cash_saved: 0,
-        replay_saved: 0,
+        replay_snapshots: Vec::new(),
+        review_changed: false,
         replay: None,
+        solver: None,
         saved_progress: Vec::new(),
         settings: first_run.then(|| settings_editor(ui_settings_placeholder())),
         credential_test: None,
@@ -180,6 +265,13 @@ pub fn run(
     let mut redraw = true;
     let mut last_size = None;
     loop {
+        if let Some(result) = ui.solver_pending.as_ref().and_then(PendingSolver::poll) {
+            let pending = ui.solver_pending.take().expect("polled solver pending");
+            redraw |= ui.accept_solver_result(pending.hand_id, pending.revision, result, &store);
+        }
+        if let Some(solver) = &mut ui.solver {
+            redraw |= solver.tick();
+        }
         if let Some(result) = ui.credential_test.as_ref().and_then(CredentialTest::poll) {
             ui.credential_test = None;
             ui.status = match result {
@@ -214,30 +306,28 @@ pub fn run(
         if let Some(result) = ui.pending.as_ref().and_then(Pending::poll) {
             redraw = true;
             ui.pending = None;
-            match result {
-                Ok(result) => {
-                    if ui
-                        .session
-                        .coaching
-                        .as_ref()
-                        .is_some_and(|d| provider::validate_feedback(&result.feedback, d).is_ok())
-                    {
-                        ui.usage.input_tokens += result.input_tokens;
-                        ui.usage.output_tokens += result.output_tokens;
-                        if let Err(e) = store.append("cloud-feedback.jsonl", &result.feedback) {
-                            ui.status = e;
-                        } else {
-                            ui.status =
-                                "Provider heuristic received · Enter continues · ? details".into();
-                        }
-                        ui.feedback = Some(result.feedback);
-                        ui.provider_feedback = true;
-                    }
-                }
-                Err(e) => ui.status = format!("{e} · Enter continues · T retries (paid)"),
+            if let Some(decision) = ui.pending_decision.take() {
+                ui.accept_provider_result(decision, result, &store);
             }
-            if let Err(e) = store.append("usage.jsonl", &ui.usage) {
-                ui.status = e;
+        }
+        let mut background_index = 0;
+        while background_index < ui.background_pending.len() {
+            if let Some(result) = ui.background_pending[background_index].1.poll() {
+                let (decision, _) = ui.background_pending.remove(background_index);
+                ui.accept_provider_result(decision, result, &store);
+                redraw = true;
+            } else {
+                background_index += 1;
+            }
+        }
+        let mut solver_index = 0;
+        while solver_index < ui.background_solvers.len() {
+            if let Some(result) = ui.background_solvers[solver_index].poll() {
+                let pending = ui.background_solvers.remove(solver_index);
+                redraw |=
+                    ui.accept_solver_result(pending.hand_id, pending.revision, result, &store);
+            } else {
+                solver_index += 1;
             }
         }
         let size = terminal.size()?;
@@ -245,10 +335,10 @@ pub fn run(
             redraw = true;
             last_size = Some(size);
         }
-        if !ui.consent
-            && !ui.help
+        if !ui.help
             && ui.settings.is_none()
             && ui.replay.is_none()
+            && ui.solver.is_none()
             && size.width >= 80
             && size.height >= 30
             && Instant::now() >= next_bot
@@ -263,6 +353,15 @@ pub fn run(
             next_bot = Instant::now() + Duration::from_millis(450);
         }
         ui.save_progress(&store);
+        if ui.review_changed && ui.replay_persisted() {
+            if let Some(replay) = &mut ui.replay {
+                if let Err(error) = replay.refresh(&store) {
+                    ui.status = error;
+                }
+            }
+            ui.review_changed = false;
+            redraw = true;
+        }
         if redraw {
             terminal.draw(|frame| draw(frame, &ui))?;
             redraw = false;
@@ -281,6 +380,14 @@ pub fn run(
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             break;
         }
+        if let Some(solver) = &mut ui.solver {
+            if solver.key(key.code) {
+                ui.solver = None;
+                ui.status = "Returned to table".into();
+                next_bot = Instant::now() + Duration::from_millis(450);
+            }
+            continue;
+        }
         if size.width < 80 || size.height < 30 {
             continue;
         }
@@ -289,6 +396,10 @@ pub fn run(
             other => other,
         };
         if let Some(mut editor) = ui.settings.take() {
+            if editor.handle_help_key(key.code) {
+                ui.settings = Some(editor);
+                continue;
+            }
             let mut close = false;
             match key.code {
                 KeyCode::Esc => {
@@ -297,7 +408,7 @@ pub fn run(
                     close = true;
                 }
                 KeyCode::Up => editor.field = editor.field.saturating_sub(1),
-                KeyCode::Down => editor.field = (editor.field + 1).min(8),
+                KeyCode::Down => editor.field = (editor.field + 1).min(12),
                 _ if editor.field == 2
                     && apply_api_key_field(&mut editor, &mut ui.status, key, &SystemKeyring) =>
                 {
@@ -369,7 +480,28 @@ pub fn run(
                         super::policy::Profile::Competent => super::policy::Profile::Fundamentals,
                     }
                 }
-                KeyCode::Enter if editor.field == 6 => {
+                KeyCode::Left | KeyCode::Right | KeyCode::Enter if editor.field == 6 => {
+                    editor.draft.solver_feedback = !editor.draft.solver_feedback;
+                    ui.status = format!(
+                        "Solver feedback {} · Save and return to apply",
+                        if editor.draft.solver_feedback {
+                            "On"
+                        } else {
+                            "Off"
+                        }
+                    );
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Enter if editor.field == 7 => {
+                    editor.draft.practice_pace = match editor.draft.practice_pace {
+                        PracticePace::Learn => PracticePace::Play,
+                        PracticePace::Play => PracticePace::Learn,
+                    };
+                    ui.status = format!(
+                        "Practice pace {:?} · Save and return to apply",
+                        editor.draft.practice_pace
+                    );
+                }
+                KeyCode::Enter if editor.field == 8 => {
                     if !editor.confirm_test {
                         editor.confirm_test = true;
                         ui.status =
@@ -408,7 +540,7 @@ pub fn run(
                         editor.confirm_test = false;
                     }
                 }
-                KeyCode::Enter if editor.field == 8 => {
+                KeyCode::Enter if editor.field == 10 => {
                     if ui.update_task.is_some() {
                         ui.status = "Update already in progress".into();
                     } else if !updates_allowed(&ui) {
@@ -444,7 +576,7 @@ pub fn run(
                         }
                     }
                 }
-                KeyCode::Enter if editor.field == 7 => {
+                KeyCode::Enter if editor.field == 9 => {
                     let credentials_changed = !editor.key.is_empty()
                         || editor.draft.coaching != ui.session.settings.coaching;
                     if credentials_changed {
@@ -477,7 +609,7 @@ pub fn run(
                                     .expect("validated settings");
                                 ui.first_run = false;
                                 ui.status = if editor.key.is_empty() {
-                                    "Setup saved; local table is ready".into()
+                                    format!("Setup saved; {} selected", active_coaching_label(&ui))
                                 } else {
                                     format!(
                                         "Setup saved with API key. {}",
@@ -488,15 +620,10 @@ pub fn run(
                                 apply_saved_settings(&mut ui, editor.draft.clone(), false)
                                     .expect("validated settings");
                                 ui.status = if editor.key.is_empty() {
-                                    if ui.consent {
-                                        "Settings saved; approve cloud coaching for this session"
-                                            .into()
-                                    } else {
-                                        format!(
-                                            "Settings saved; {} active",
-                                            active_coaching_label(&ui)
-                                        )
-                                    }
+                                    format!(
+                                        "Settings saved; {} selected",
+                                        active_coaching_label(&ui)
+                                    )
                                 } else {
                                     format!(
                                         "Settings and API key saved. {}",
@@ -522,7 +649,7 @@ pub fn run(
         if let Some(mut replay) = ui.replay.take() {
             match replay.key(key.code, &store) {
                 Ok(true) => {
-                    ui.refresh_practice(&store);
+                    ui.sync_practice_progress(&store);
                     ui.status = "Returned to table".into();
                 }
                 Ok(false) => ui.replay = Some(replay),
@@ -533,26 +660,14 @@ pub fn run(
             }
             continue;
         }
-        if code == KeyCode::Char('s') && ui.session.coaching.is_none() {
+        if code == KeyCode::Char('s') {
             ui.settings = Some(settings_editor(ui.session.settings.clone()));
             continue;
         }
-        if code == KeyCode::Char('v') && replay_available(&ui) {
+        if matches!(code, KeyCode::Char('v' | 'r')) && replay_available(&ui) {
             match super::replay_ui::ReplayUi::open(&store) {
                 Ok(replay) => ui.replay = Some(replay),
                 Err(e) => ui.status = e,
-            }
-            continue;
-        }
-        if ui.consent {
-            match code {
-                KeyCode::Enter => {
-                    accept_cloud_for_session(&mut ui);
-                }
-                KeyCode::Esc | KeyCode::Char('l') => {
-                    skip_cloud_for_session(&mut ui);
-                }
-                _ => {}
             }
             continue;
         }
@@ -570,6 +685,13 @@ pub fn run(
             }
             continue;
         }
+        if code == KeyCode::Char('g') {
+            match super::solver_ui::SolverUi::new(None) {
+                Ok(solver) => ui.solver = Some(solver),
+                Err(error) => ui.status = error,
+            }
+            continue;
+        }
         if ui.session.coaching.is_some() {
             if ui.deep && scroll_deep(&mut ui.deep_scroll, code) {
                 continue;
@@ -580,9 +702,11 @@ pub fn run(
                     ui.deep_scroll = 0;
                 }
                 KeyCode::Enter => {
-                    ui.pending = None;
+                    ui.retire_current_pending();
                     ui.session.continue_hand();
                     ui.feedback = None;
+                    ui.baseline_feedback = None;
+                    ui.provider_feedback = false;
                     ui.provider_feedback = false;
                     ui.deep = false;
                     ui.deep_scroll = 0;
@@ -747,20 +871,38 @@ pub fn run(
         if let Some(action) = action {
             match ui.session.submit(action) {
                 Ok(d) => {
-                    let f = local_feedback(d);
+                    let decision = d.clone();
+                    ui.retire_current_pending();
+                    let f = local_feedback(&decision);
                     ui.progress.decisions += 1;
                     ui.progress.note_review(&f.concept, &f.assessment);
                     *ui.progress.concepts.entry(f.concept.clone()).or_default() += 1;
-                    if let Err(e) = store.decision(d, &f) {
+                    if let Err(e) = store.decision(&decision, &f) {
                         ui.status = e;
                     } else {
                         ui.status =
                             "Decision accepted · hand paused · Enter continues · ? details".into();
                     }
                     ui.refresh_practice(&store);
+                    ui.baseline_feedback = Some(f.clone());
                     ui.feedback = Some(f);
+                    ui.begin_solver_feedback(decision);
                     if ui.cloud_enabled {
                         ui.request(&store);
+                    }
+                    if ui.session.settings.practice_pace == PracticePace::Play {
+                        ui.session.continue_hand();
+                        ui.feedback = None;
+                        ui.baseline_feedback = None;
+                        ui.provider_feedback = false;
+                        ui.deep = false;
+                        ui.deep_scroll = 0;
+                        ui.status = if ui.session.finished() {
+                            "Hand complete · R reviews decisions · Enter deals next".into()
+                        } else {
+                            "Playing · review after the hand".into()
+                        };
+                        next_bot = Instant::now() + Duration::from_millis(450);
                     }
                 }
                 Err(e) => ui.status = format!("Not accepted: {e}"),
@@ -768,6 +910,7 @@ pub fn run(
         }
     }
     ui.pending = None;
+    ui.cancel_solver_feedback();
     ui.update_task = None;
     ui.save_progress(&store);
     let restart = ui.restart_notice.clone();
@@ -788,47 +931,58 @@ fn apply_saved_settings(
 ) -> Result<(), String> {
     let same_cloud_target = ui.session.settings.coaching == settings.coaching
         && ui.session.settings.cloud.model == settings.cloud.model;
-    let keep_cloud_enabled = !reset_session && ui.cloud_enabled && same_cloud_target;
+    let was_solver_enabled = ui.session.settings.solver_feedback;
     if reset_session {
         ui.session = Session::new(settings)?;
     } else {
         ui.session.settings = settings;
     }
-    ui.cloud_enabled = keep_cloud_enabled;
-    ui.consent = selected_provider(ui.session.settings.coaching).is_some() && !keep_cloud_enabled;
-    ui.pending = None;
-    ui.provider_feedback = false;
+    ui.cloud_enabled = selected_provider(ui.session.settings.coaching).is_some();
+    if !same_cloud_target || reset_session {
+        ui.pending = None;
+        ui.pending_decision = None;
+        ui.background_pending.clear();
+        ui.provider_feedback = false;
+        ui.baseline_feedback = None;
+    }
+    if !ui.session.settings.solver_feedback || reset_session {
+        ui.cancel_solver_feedback();
+        ui.background_solvers.clear();
+    }
+    if let Some(decision) = ui.session.coaching.clone() {
+        let baseline = ui
+            .baseline_feedback
+            .clone()
+            .unwrap_or_else(|| local_feedback(&decision));
+        ui.baseline_feedback = Some(baseline.clone());
+        if !ui.solver_feedback {
+            ui.feedback = Some(baseline);
+        }
+        if ui.session.settings.solver_feedback && !was_solver_enabled {
+            ui.begin_solver_feedback(decision);
+        }
+        if ui.session.settings.practice_pace == PracticePace::Play {
+            ui.retire_current_pending();
+            ui.session.continue_hand();
+            ui.feedback = None;
+            ui.baseline_feedback = None;
+            ui.provider_feedback = false;
+            ui.status = "Playing · review after the hand".into();
+        }
+    }
     Ok(())
 }
 
-fn requires_cloud_consent(mode: CoachingMode) -> bool {
-    selected_provider(mode).is_some()
-}
-
-fn accept_cloud_for_session(ui: &mut Ui) {
-    ui.consent = false;
-    ui.cloud_enabled = true;
-    ui.status =
-        "Cloud coaching enabled for this session · optional calls may incur provider charges"
-            .into();
-}
-
-fn skip_cloud_for_session(ui: &mut Ui) {
-    ui.consent = false;
-    ui.cloud_enabled = false;
-    let saved = selected_provider(ui.session.settings.coaching)
-        .map(provider_label)
-        .unwrap_or("cloud");
-    ui.status =
-        format!("Local coaching this session · {saved} remains selected · no network requests");
-}
-
 fn active_coaching_label(ui: &Ui) -> String {
-    match selected_provider(ui.session.settings.coaching) {
-        Some(provider) if ui.cloud_enabled => format!("{} coaching", provider_label(provider)),
-        Some(provider) => format!("local · {} selected", provider_label(provider)),
+    let base = match selected_provider(ui.session.settings.coaching) {
+        Some(provider) => format!("{} coaching", provider_label(provider)),
         None if ui.session.settings.coaching == CoachingMode::Off => "coaching off".into(),
         None => "local coaching".into(),
+    };
+    if ui.session.settings.solver_feedback {
+        format!("solver on · {base}")
+    } else {
+        base
     }
 }
 
@@ -850,6 +1004,169 @@ fn scroll_deep(scroll: &mut u16, code: KeyCode) -> bool {
     true
 }
 impl Ui {
+    fn sync_practice_progress(&mut self, store: &Store) {
+        match store.progress() {
+            Ok(saved) => self.progress.drills = saved.drills,
+            Err(error) => self.status = error,
+        }
+        self.refresh_practice(store);
+    }
+
+    fn replay_persisted(&self) -> bool {
+        self.replay_snapshots.len() == self.session.replay_ready.len()
+            && self
+                .session
+                .replay_ready
+                .iter()
+                .enumerate()
+                .all(|(index, hand)| {
+                    serde_json::to_vec(hand).ok().as_ref() == self.replay_snapshots.get(index)
+                })
+    }
+
+    fn accept_provider_result(
+        &mut self,
+        decision: super::facts::Decision,
+        result: Result<provider::ProviderResult, String>,
+        store: &Store,
+    ) {
+        match result {
+            Ok(result) => {
+                if let Err(error) = provider::validate_feedback(&result.feedback, &decision) {
+                    self.status = error;
+                    return;
+                }
+                self.usage.input_tokens += result.input_tokens;
+                self.usage.output_tokens += result.output_tokens;
+                self.review_changed |= self.session.record_review_feedback(&result.feedback);
+                if let Err(error) = store.append("cloud-feedback.jsonl", &result.feedback) {
+                    self.status = error;
+                }
+                let paused = self.session.coaching.as_ref().is_some_and(|current| {
+                    current.observation.hand_id == decision.observation.hand_id
+                        && current.observation.revision == decision.observation.revision
+                });
+                if paused {
+                    self.baseline_feedback = Some(result.feedback.clone());
+                    if !self.solver_feedback {
+                        self.feedback = Some(result.feedback);
+                    }
+                    self.provider_feedback = true;
+                    self.status = if self.solver_feedback {
+                        "Cloud coaching ready too · solver assessment retained · ? both".into()
+                    } else {
+                        "Coaching ready · ? details · Enter continues".into()
+                    };
+                } else if self.session.finished() {
+                    self.status = "Coaching added to hand review · R opens it".into();
+                }
+            }
+            Err(error) => {
+                self.status = format!("Coaching unavailable: {error}");
+            }
+        }
+        if let Err(error) = store.append("usage.jsonl", &self.usage) {
+            self.status = error;
+        }
+    }
+
+    fn retire_current_pending(&mut self) {
+        if let (Some(decision), Some(pending)) = (self.pending_decision.take(), self.pending.take())
+        {
+            self.background_pending.push((decision, pending));
+        }
+        if let Some(solver) = self.solver_pending.take() {
+            self.background_solvers.push(solver);
+        }
+        self.solver_feedback = false;
+        self.solver_note = None;
+    }
+
+    fn accept_solver_result(
+        &mut self,
+        hand_id: u64,
+        revision: u64,
+        result: Result<Feedback, String>,
+        store: &Store,
+    ) -> bool {
+        let current = self.session.coaching.as_ref().is_some_and(|decision| {
+            decision.observation.hand_id == hand_id && decision.observation.revision == revision
+        });
+        if !self.session.settings.solver_feedback {
+            return false;
+        }
+        if let Ok(feedback) = &result {
+            if feedback.hand_id != hand_id || feedback.revision != revision {
+                return false;
+            }
+        }
+        match result {
+            Ok(feedback)
+                if feedback.hand_id == hand_id
+                    && feedback.revision == revision
+                    && feedback.evidence_basis == "solver" =>
+            {
+                if !self.session.record_review_feedback(&feedback) {
+                    return false;
+                }
+                self.review_changed = true;
+                if let Err(error) = store.append("solver-feedback.jsonl", &feedback) {
+                    self.status = error;
+                }
+                if current {
+                    self.solver_feedback = true;
+                    self.solver_note = Some("Solver · modeled ranges".into());
+                    self.status = "Solver feedback ready · modeled ranges · ? both".into();
+                    self.feedback = Some(feedback);
+                } else if self.session.finished() {
+                    self.status = "Solver analysis added to hand review · R opens it".into();
+                }
+            }
+            Ok(_) if current => {
+                self.solver_note = Some("Solver result rejected; coaching shown".into());
+                self.status = self.solver_note.clone().unwrap_or_default();
+            }
+            Err(error) if current => {
+                self.solver_note = Some(format!("Solver unavailable: {error}; coaching shown"));
+                self.status = self.solver_note.clone().unwrap_or_default();
+            }
+            Err(error) => self.status = format!("Solver review unavailable: {error}"),
+            Ok(_) => {}
+        }
+        true
+    }
+
+    fn cancel_solver_feedback(&mut self) {
+        self.solver_pending = None;
+        self.solver_feedback = false;
+        self.solver_note = None;
+    }
+
+    /// Returns true when a supported local solve was started for this exact decision.
+    fn begin_solver_feedback(&mut self, decision: super::facts::Decision) -> bool {
+        self.cancel_solver_feedback();
+        if !self.session.settings.solver_feedback {
+            return false;
+        }
+        match live_solver::eligibility(&decision) {
+            Ok(()) => {
+                if self.background_solvers.len() >= 8 {
+                    self.solver_note = Some("Solver queue full; local review saved".into());
+                    return false;
+                }
+                self.solver_pending = Some(PendingSolver::start(decision));
+                self.solver_note =
+                    Some("Solver calculating · local heuristic shown meanwhile".into());
+                self.status = self.solver_note.clone().unwrap_or_default();
+                true
+            }
+            Err(reason) => {
+                self.solver_note = Some(format!("Solver coverage: {reason}"));
+                false
+            }
+        }
+    }
+
     fn request(&mut self, store: &Store) {
         let Some(d) = self.session.coaching.clone() else {
             return;
@@ -870,7 +1187,7 @@ impl Ui {
             })
             .and_then(|key| {
                 provider::start(
-                    d,
+                    d.clone(),
                     kind,
                     self.session.settings.cloud.clone(),
                     key,
@@ -880,9 +1197,15 @@ impl Ui {
         match result {
             Ok(p) => {
                 self.pending = Some(p);
-                self.status = "Requesting coaching… Enter cancels and continues · Q quits".into();
+                self.pending_decision = Some(d);
+                if self.session.settings.practice_pace == PracticePace::Learn {
+                    self.status = "Requesting coaching… Enter continues · ? details".into();
+                }
             }
-            Err(e) => self.status = format!("Coaching unavailable: {e}"),
+            Err(e) => {
+                self.pending_decision = None;
+                self.status = format!("Coaching unavailable: {e}");
+            }
         }
         if let Err(e) = store.append("usage.jsonl", &self.usage) {
             self.status = e;
@@ -912,15 +1235,22 @@ impl Ui {
             }
             self.cash_saved += 1;
         }
-        while self.replay_saved < self.session.replay_ready.len() {
-            if let Err(e) = store.append(
-                "completed-hands.jsonl",
-                &self.session.replay_ready[self.replay_saved],
-            ) {
-                self.status = e;
-                break;
+        if self.review_changed || self.replay_snapshots.len() != self.session.replay_ready.len() {
+            for (index, hand) in self.session.replay_ready.iter().enumerate() {
+                let snapshot = serde_json::to_vec(hand).unwrap_or_default();
+                if self.replay_snapshots.get(index) == Some(&snapshot) {
+                    continue;
+                }
+                if let Err(error) = store.append("completed-hands.jsonl", hand) {
+                    self.status = error;
+                    break;
+                }
+                if index < self.replay_snapshots.len() {
+                    self.replay_snapshots[index] = snapshot;
+                } else {
+                    self.replay_snapshots.push(snapshot);
+                }
             }
-            self.replay_saved += 1;
         }
     }
     fn refresh_practice(&mut self, store: &Store) {
@@ -998,6 +1328,23 @@ fn replay_available(ui: &Ui) -> bool {
 fn ui_settings_placeholder() -> Settings {
     Settings::default()
 }
+fn settings_help(field: usize) -> (&'static str, &'static str) {
+    match field {
+        0 => ("Provider", "Select local, OpenAI, or Anthropic coaching. A saved cloud choice stays selected across launches and can request coaching after accepted decisions. Local and Off use no cloud provider. Changes apply when you save."),
+        1 => ("Model", "Choose a listed provider model with Left/Right, or press E to type a custom model ID. This matters only for cloud coaching. Changes apply when you save."),
+        2 => ("API key", "Type or paste a provider key for optional cloud coaching. Ctrl-V changes visibility and Ctrl-X confirms forgetting a saved key. Help never displays the key. A new key is stored only when you save."),
+        3 => ("Session limit", "Maximum optional cloud coaching requests in one session. Left/Right adjusts the limit; it does not affect local solver calculations. Save to apply."),
+        4 => ("Table", "Choose 2–9 seats with Left/Right. Blinds are shown here and can be changed with CLI flags. Save to apply the seat count to a new session."),
+        5 => ("Opponents", "Choose a heuristic opponent profile with Left/Right. These bots do not use the solver. Save to apply."),
+        6 => ("Solver feedback", "Turn on local solver feedback for eligible heads-up river decisions. Existing coaching remains available in the expanded ? review. Unsupported decisions keep their coaching explanation. Off restores that explanation. Save to apply; no key or cloud request is needed for solver work."),
+        7 => ("Practice pace", "Learn pauses after each accepted decision to show feedback. Play continues the hand immediately and saves decision review for the hand end. Left/Right or Enter switches the pace; save to apply. Cloud requests never hold the table."),
+        8 => ("Test key", "Press Enter twice to make one explicit, potentially billable provider test request. This does not turn on solver feedback or save settings."),
+        9 => ("Save and return", "Validate and save these settings. Unsaved edits remain in this screen until saved. Solver feedback and Learn/Play pace apply after saving."),
+        10 => ("Updates", "Check for a published release between hands. Installing an offered release requires a second Enter. This does not change solver or coaching settings."),
+        11 => ("Cloud limits", "Shows the configured model output limit, budget, and pricing date. Change these with CLI flags, then save settings. Local solver work uses no provider budget."),
+        _ => ("Status", "Shows the latest setup or connection result. It does not expose your API key. Use Up/Down to return to an editable row."),
+    }
+}
 fn settings_editor(draft: Settings) -> SettingsEditor {
     let source = credential_source_label(draft.coaching, false);
     SettingsEditor {
@@ -1012,6 +1359,7 @@ fn settings_editor(draft: Settings) -> SettingsEditor {
         update_note: format!("installed {} · Enter checks", update::current_version()),
         update_offer: None,
         confirm_install: false,
+        help: false,
     }
 }
 
@@ -1022,7 +1370,7 @@ fn credential_source_label(mode: CoachingMode, entered: bool) -> String {
     if entered {
         "entered; not saved".into()
     } else if selected_provider(mode).is_some() {
-        "saved key not checked".into()
+        "key checked when coaching runs".into()
     } else {
         "local; no key needed".into()
     }
@@ -1096,7 +1444,77 @@ fn apply_api_key_field(
     }
     handled
 }
+fn expanded_review_copy(ui: &Ui, decision: &super::facts::Decision) -> String {
+    let mut body = format!(
+        "YOUR ACTION  {}\nTOPIC  {}",
+        accepted_action_copy(&decision.accepted_action),
+        ui.feedback
+            .as_ref()
+            .map(|feedback| normalize_paragraph(&feedback.concept))
+            .unwrap_or_else(|| "General decision review".into()),
+    );
+    if ui.session.settings.solver_feedback {
+        body.push_str("\n\nSOLVER ANALYSIS — MODELED RANGES\n");
+        if ui.solver_feedback {
+            if let Some(feedback) = &ui.feedback {
+                body.push_str(&coaching_explanation(feedback));
+                if let Some(alternative) = &feedback.alternative_action {
+                    body.push_str("\nCONSIDER  ");
+                    body.push_str(alternative);
+                }
+                if !feedback.assumptions.is_empty() {
+                    body.push('\n');
+                    body.push_str(&feedback.assumptions.join("\n"));
+                }
+            }
+        } else {
+            body.push_str(ui.solver_note.as_deref().unwrap_or("Solver not ready"));
+        }
+    }
+    body.push_str(if ui.session.settings.coaching == CoachingMode::Off {
+        "\n\nCOACHING EXPLANATION — OFF\n"
+    } else if ui.provider_feedback {
+        "\n\nCOACHING EXPLANATION — CLOUD PROVIDER HEURISTIC\n"
+    } else {
+        "\n\nCOACHING EXPLANATION — LOCAL HEURISTIC\n"
+    });
+    if ui.session.settings.coaching == CoachingMode::Off {
+        body.push_str("Coaching is off for this session.");
+    } else if let Some(feedback) = ui.baseline_feedback.as_ref().or({
+        if ui.solver_feedback {
+            None
+        } else {
+            ui.feedback.as_ref()
+        }
+    }) {
+        body.push_str(&coaching_explanation(feedback));
+        if let Some(alternative) = &feedback.alternative_action {
+            body.push_str("\nCONSIDER  ");
+            body.push_str(alternative);
+        }
+        if !feedback.assumptions.is_empty() {
+            body.push('\n');
+            body.push_str(&feedback.assumptions.join("\n"));
+        }
+    } else {
+        body.push_str("Coaching explanation unavailable");
+    }
+    body.push_str(&format!(
+        "\n\nDECISION FACTS\n{} · {}\nLegal call: {} chips. Contestable pot after call: {} chips.\n{}",
+        decision.facts.position,
+        decision.facts.hand_classification,
+        decision.facts.call_cost,
+        decision.facts.contestable_pot_after_call,
+        decision.facts.assumptions[0],
+    ));
+    body
+}
+
 fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
+    if let Some(solver) = &ui.solver {
+        solver.draw(frame);
+        return;
+    }
     if let Some(replay) = &ui.replay {
         replay.draw(frame);
         return;
@@ -1111,6 +1529,18 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
         return;
     }
     if let Some(editor) = &ui.settings {
+        if editor.help {
+            let (heading, explanation) = settings_help(editor.field);
+            frame.render_widget(
+                Paragraph::new(format!("{explanation}\n\n? or Esc returns to the same setting. Unsaved edits are preserved."))
+                    .style(base)
+                    .wrap(Wrap { trim: true })
+                    .block(Block::default().borders(Borders::ALL)
+                        .title(format!("SETTINGS HELP · {heading}"))),
+                area,
+            );
+            return;
+        }
         let key = if editor.key.is_empty() {
             "(leave unchanged)".into()
         } else {
@@ -1136,6 +1566,18 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
                 editor.draft.seats, editor.draft.small_blind, editor.draft.big_blind
             ),
             format!("Opponents      {:?}", editor.draft.opponents.profile),
+            format!(
+                "Solver feedback  {} [←/→/Enter] · local HU river only",
+                if editor.draft.solver_feedback {
+                    "On"
+                } else {
+                    "Off"
+                }
+            ),
+            format!(
+                "Practice pace  {:?} [←/→/Enter] · Learn pauses / Play continues",
+                editor.draft.practice_pace
+            ),
             if editor.confirm_test {
                 "Test key       CONFIRM billable request with Enter".into()
             } else {
@@ -1172,7 +1614,7 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
         super::table_ui::render_settings_panel(
             frame,
             area,
-            &format!("SETTINGS · credential: {}", editor.source),
+            &format!("SETTINGS · ? help selected · credential: {}", editor.source),
             &rows,
             editor.field,
         );
@@ -1180,11 +1622,8 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
     }
     let p = ui.session.view();
     let bb = f64::from(ui.session.settings.big_blind);
-    let (title, body) = if ui.consent {
-        let kind = selected_provider(ui.session.settings.coaching).expect("cloud consent provider");
-        (" ENABLE OPTIONAL CLOUD COACHING ",format!("Destination: {}\nModel: {} · credential: {} or OS keychain\nOnly your pre-decision cards, public table/action data and teaching facts leave this device.\nProvider charges and data terms apply. Limit: {} requests / session.\nEnter enables paid coaching this session. Esc or L plays with local teaching.\nNo request is made until you accept a poker decision.",kind.endpoint(),ui.session.settings.cloud.model,kind.environment(),ui.session.settings.cloud.max_requests))
-    } else if ui.help {
-        (" HOW TO PLAY ","F folds · C checks or calls · R opens bet/raise TO entry in chips.\nEnter submits an amount; arrows adjust by one chip. A asks for all-in confirmation.\nAfter every accepted decision the table pauses: Enter continues, ? expands teaching.\nBetween hands: V browses saved hands; B tops up/rebuys; W withdraws; Enter deals.\nIn replay: arrows browse; B bookmarks; O shows outcome; Esc returns.\nRun openfelt --drill <topic> for a short offline practice set.\nS opens settings. Between hands, Updates can check for a release; it never installs by itself.\nBots use reviewed heuristic ranges, style, and difficulty—not solver strategies.\nSettings and private learning history live in your local OpenFelt data folder.\nQ quits at any time. No timer acts for you.".into())
+    let (title, body) = if ui.help {
+        (" HOW TO PLAY ","F folds · C checks or calls · R opens bet/raise TO entry in chips.\nEnter submits an amount; arrows adjust by one chip. A asks for all-in confirmation.\nLearn pauses after each decision: Enter continues, ? expands teaching. Play continues to hand end.\nBetween hands: R or V reviews saved decisions; B tops up; W withdraws; Enter deals.\nIn replay: arrows browse; B bookmarks; O shows outcome; Esc returns.\nRun openfelt --drill <topic> for a short offline practice set.\nG opens local river solver practice; Esc returns to the table.\nS opens settings. A saved cloud provider stays selected across launches; Local or Off stops requests.\nBetween hands, Updates can check for a release; it never installs by itself.\nBots use reviewed heuristic ranges, style, and difficulty—not solver strategies.\nSettings and private learning history live in your local OpenFelt data folder.\nQ quits at any time. No timer acts for you.".into())
     } else if matches!(ui.input, Input::AllIn) {
         (
             " CONFIRM ALL-IN ",
@@ -1196,39 +1635,41 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
             format!("Amount: {amount}\nEnter confirms · Esc cancels"),
         )
     } else if let Some(d) = &ui.session.coaching {
-        let explanation = if ui.session.settings.coaching == CoachingMode::Off {
-            "Coaching off. Your decision is accepted.".into()
-        } else if let Some(f) = &ui.feedback {
-            coaching_explanation(f)
-        } else {
-            "Coaching unavailable".into()
-        };
-        let details = if ui.deep {
-            format!(
-                "\nTOPIC  {}\n{} · {}\nLegal call: {} chips. Contestable pot after call: {} chips.\n{}",
-                ui.feedback
-                    .as_ref()
-                    .map(|feedback| normalize_paragraph(&feedback.concept))
-                    .unwrap_or_else(|| "General decision review".into()),
-                d.facts.position,
-                d.facts.hand_classification,
-                d.facts.call_cost,
-                d.facts.contestable_pot_after_call,
-                d.facts.assumptions[0]
-            )
-        } else {
-            String::new()
-        };
+        let explanation =
+            if ui.session.settings.coaching == CoachingMode::Off && !ui.solver_feedback {
+                if ui.session.settings.solver_feedback {
+                    format!(
+                        "Coaching is off. {}",
+                        ui.solver_note
+                            .as_deref()
+                            .unwrap_or("Solver review is pending.")
+                    )
+                } else {
+                    "Coaching off. Your decision is accepted.".into()
+                }
+            } else if let Some(f) = &ui.feedback {
+                coaching_explanation(f)
+            } else {
+                "Coaching unavailable".into()
+            };
         (
-            " AFTER YOUR DECISION ",
-            structured_coaching_copy(
-                d,
-                &explanation,
-                ui.feedback
-                    .as_ref()
-                    .and_then(|f| f.alternative_action.as_deref()),
-                ui.deep,
-            ) + &details,
+            if ui.solver_feedback {
+                " AFTER YOUR DECISION · SOLVER "
+            } else {
+                " AFTER YOUR DECISION "
+            },
+            if ui.deep {
+                expanded_review_copy(ui, d)
+            } else {
+                structured_coaching_copy(
+                    d,
+                    &explanation,
+                    ui.feedback
+                        .as_ref()
+                        .and_then(|f| f.alternative_action.as_deref()),
+                    false,
+                )
+            },
         )
     } else if ui.session.finished() {
         let practice = ui
@@ -1236,22 +1677,27 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
             .as_ref()
             .map(|note| format!("\n{note}"))
             .unwrap_or_default();
-        (" HAND COMPLETE ",format!("{}\nSession profit: {:+} chips (excludes top-ups and withdrawals).\nProgress: {} completed hands · {} decisions reviewed.\nEnter next hand · V replay · B top up · W withdraw{practice}",ui.session.result_summary().unwrap_or_else(|| "Hand settled".into()),ui.session.session_profit,ui.progress.hands,ui.progress.decisions))
+        (" HAND COMPLETE ",format!("{}\nSession profit: {:+} chips (excludes top-ups and withdrawals).\nProgress: {} completed hands · {} decisions reviewed.\nR or V review decisions and mistakes · Enter next hand · B top up · W withdraw{practice}",ui.session.result_summary().unwrap_or_else(|| "Hand settled".into()),ui.session.session_profit,ui.progress.hands,ui.progress.decisions))
     } else if p.to_act == Some(hero()) {
         (
             " YOUR NEXT DECISION ",
             format!(
                 "{}\n{}",
                 ui.session
-                .observation(hero())
-                .map(|o| {
-                    format!(
-                        "Call costs {} chips / {:.1} BB.\nTake your time. Coaching appears after your choice.",
-                        o.call_cost(),
-                        f64::from(o.call_cost()) / bb
-                    )
-                })
-                .unwrap_or_else(|_| ui.status.clone()),
+                    .observation(hero())
+                    .map(|o| {
+                        format!(
+                            "Call costs {} chips / {:.1} BB.\n{}",
+                            o.call_cost(),
+                            f64::from(o.call_cost()) / bb,
+                            if ui.session.settings.practice_pace == PracticePace::Learn {
+                                "Learn pauses after your choice for feedback."
+                            } else {
+                                "Play continues; review this choice after the hand."
+                            }
+                        )
+                    })
+                    .unwrap_or_else(|_| ui.status.clone()),
                 ui.status
             ),
         )
@@ -1294,6 +1740,12 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
         ui.feedback.as_ref(),
         ui.provider_feedback,
         ui.pending.is_some(),
+        ui.solver_feedback,
+        ui.solver_pending.is_some(),
+        ui.solver_note.as_deref().is_some_and(|note| {
+            note.starts_with("Solver unavailable") || note.starts_with("Solver result rejected")
+        }),
+        ui.session.settings.coaching == CoachingMode::Off,
     );
     let active_coaching = active_coaching_label(ui);
     super::table_ui::render(
@@ -1315,7 +1767,7 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
         },
     );
 
-    if ui.help || ui.consent {
+    if ui.help {
         let panel = ratatui::layout::Rect {
             x: area.x + 5,
             y: area.y + 4,
@@ -1344,17 +1796,51 @@ fn review_presentation(
     feedback: Option<&Feedback>,
     provider_feedback: bool,
     pending: bool,
+    solver_feedback: bool,
+    solver_pending: bool,
+    solver_note: bool,
+    coaching_off: bool,
 ) -> (Option<super::table_ui::ReviewTone>, Option<&'static str>) {
+    if solver_feedback {
+        return (
+            feedback.map(|f| super::table_ui::ReviewTone::from_assessment(&f.assessment)),
+            Some("Solver · modeled ranges · ? both explanations"),
+        );
+    }
+    if solver_pending {
+        return (
+            feedback.map(|f| super::table_ui::ReviewTone::from_assessment(&f.assessment)),
+            Some(if coaching_off {
+                "Solver calculating · coaching off"
+            } else if provider_feedback {
+                "AI heuristic · solver calculating"
+            } else {
+                "Local heuristic · solver calculating"
+            }),
+        );
+    }
     if pending {
         return (
             Some(super::table_ui::ReviewTone::Uncertain),
-            Some("Awaiting provider heuristic"),
+            Some(if solver_note {
+                "Solver unavailable · awaiting provider heuristic"
+            } else {
+                "Awaiting provider heuristic"
+            }),
         );
     }
     let tone =
         feedback.map(|feedback| super::table_ui::ReviewTone::from_assessment(&feedback.assessment));
     let source = feedback.map(|_| {
-        if provider_feedback {
+        if coaching_off && solver_note {
+            "Solver unavailable · coaching off"
+        } else if coaching_off {
+            "Coaching off"
+        } else if provider_feedback && solver_note {
+            "AI heuristic · solver unavailable"
+        } else if solver_note {
+            "Local heuristic · solver unavailable"
+        } else if provider_feedback {
             "AI suggestion · heuristic"
         } else {
             "Local guidance · heuristic"
@@ -1480,7 +1966,11 @@ pub fn humanize_coaching(copy: &str) -> String {
 }
 
 pub fn coaching_explanation(feedback: &Feedback) -> String {
-    humanize_coaching(&feedback.explanation)
+    if feedback.evidence_basis == "solver" {
+        normalize_paragraph(&feedback.explanation)
+    } else {
+        humanize_coaching(&feedback.explanation)
+    }
 }
 
 /// Compatibility alias for render-preview callers. Compact clipping is owned
@@ -1511,12 +2001,18 @@ mod tests {
             .unwrap(),
             input: Input::Play,
             feedback: None,
+            baseline_feedback: None,
+            solver_pending: None,
+            background_solvers: Vec::new(),
+            solver_feedback: false,
+            solver_note: None,
             pending: None,
+            pending_decision: None,
+            background_pending: Vec::new(),
             status: "Ready".into(),
             deep: false,
             deep_scroll: 0,
             help: false,
-            consent: false,
             cloud_enabled: false,
             provider_feedback: false,
             usage: Usage::default(),
@@ -1524,8 +2020,10 @@ mod tests {
             accounted_hands: 0,
             accounted_profit: 0,
             cash_saved: 0,
-            replay_saved: 0,
+            replay_snapshots: Vec::new(),
+            review_changed: false,
             replay: None,
+            solver: None,
             saved_progress: vec![],
             settings: None,
             credential_test: None,
@@ -1576,56 +2074,44 @@ mod tests {
         assert_eq!(editor.source, "local; no key needed");
         assert_eq!(
             credential_source_label(CoachingMode::Openai, false),
-            "saved key not checked"
+            "key checked when coaching runs"
         );
-        let mut cloud_ui = ui(2);
-        cloud_ui.session.settings.coaching = CoachingMode::Openai;
-        cloud_ui.consent = true;
+        let cloud_ui = ui(2);
         assert!(cloud_ui.credentials.openai.is_none());
         assert!(cloud_ui.credentials.anthropic.is_none());
     }
 
     #[test]
-    fn saved_cloud_provider_survives_skip_save_and_relaunch_without_key_access() {
+    fn saved_cloud_provider_stays_enabled_until_local_or_off_without_key_access() {
         let mut ui = ui(2);
         let mut saved = ui.session.settings.clone();
         saved.coaching = CoachingMode::Openai;
         saved.cloud.model = "gpt-5.4-nano".into();
 
         apply_saved_settings(&mut ui, saved.clone(), false).unwrap();
-        assert!(ui.consent);
-        assert!(!ui.cloud_enabled);
+        assert!(ui.cloud_enabled);
         assert_eq!(ui.session.settings.coaching, CoachingMode::Openai);
-        assert_eq!(active_coaching_label(&ui), "local · OpenAI selected");
-        assert!(ui.credentials.openai.is_none());
-
-        skip_cloud_for_session(&mut ui);
-        assert!(!ui.consent && !ui.cloud_enabled);
-        assert_eq!(ui.session.settings.coaching, CoachingMode::Openai);
-        assert!(ui.status.contains("OpenAI remains selected"));
-        assert!(requires_cloud_consent(saved.coaching));
-
-        apply_saved_settings(&mut ui, saved.clone(), false).unwrap();
-        assert!(ui.consent, "saving while local asks before enabling cloud");
-        accept_cloud_for_session(&mut ui);
         assert_eq!(active_coaching_label(&ui), "OpenAI coaching");
-        assert!(
-            ui.credentials.openai.is_none(),
-            "consent does not read a key"
-        );
+        assert!(ui.credentials.openai.is_none());
 
         let mut unrelated = saved;
         unrelated.seats = 3;
         apply_saved_settings(&mut ui, unrelated, false).unwrap();
-        assert!(
-            ui.cloud_enabled,
-            "unrelated settings preserve session consent"
-        );
-        assert!(!ui.consent);
+        assert!(ui.cloud_enabled);
+        assert!(ui.credentials.openai.is_none());
+
+        let mut local = ui.session.settings.clone();
+        local.coaching = CoachingMode::Local;
+        apply_saved_settings(&mut ui, local, false).unwrap();
+        assert!(!ui.cloud_enabled);
+        let mut off = ui.session.settings.clone();
+        off.coaching = CoachingMode::Off;
+        apply_saved_settings(&mut ui, off, false).unwrap();
+        assert!(!ui.cloud_enabled);
     }
 
     #[test]
-    fn unrelated_settings_save_roundtrips_the_selected_cloud_provider_after_skip() {
+    fn unrelated_settings_save_roundtrips_active_cloud_provider() {
         let root = std::env::temp_dir().join(format!(
             "openfelt-provider-persistence-{}-{:016x}",
             std::process::id(),
@@ -1638,34 +2124,39 @@ mod tests {
         };
         store.save("settings.json", &saved).unwrap();
 
-        let mut ui = ui(2);
-        apply_saved_settings(&mut ui, store.settings().unwrap(), false).unwrap();
-        skip_cloud_for_session(&mut ui);
+        let mut current = ui(2);
+        apply_saved_settings(&mut current, store.settings().unwrap(), false).unwrap();
+        assert!(current.cloud_enabled);
         saved.seats = 3;
-        apply_saved_settings(&mut ui, saved.clone(), false).unwrap();
-        store.save("settings.json", &ui.session.settings).unwrap();
+        apply_saved_settings(&mut current, saved.clone(), false).unwrap();
+        store
+            .save("settings.json", &current.session.settings)
+            .unwrap();
 
         let reloaded = store.settings().unwrap();
         assert_eq!(reloaded.coaching, CoachingMode::Openai);
         assert_eq!(reloaded.seats, 3);
-        assert!(requires_cloud_consent(reloaded.coaching));
+        let mut relaunched = ui(2);
+        apply_saved_settings(&mut relaunched, reloaded, false).unwrap();
+        assert!(relaunched.cloud_enabled);
+        assert!(relaunched.credentials.openai.is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn changing_cloud_destination_requires_fresh_consent_without_resolving_a_key() {
+    fn changing_cloud_destination_activates_saved_provider_without_resolving_a_key() {
         let mut ui = ui(2);
         let mut openai = ui.session.settings.clone();
         openai.coaching = CoachingMode::Openai;
         apply_saved_settings(&mut ui, openai, false).unwrap();
-        accept_cloud_for_session(&mut ui);
+        assert!(ui.cloud_enabled);
 
         let mut anthropic = ui.session.settings.clone();
         anthropic.coaching = CoachingMode::Anthropic;
         anthropic.cloud.model = "claude-sonnet-4-5".into();
         apply_saved_settings(&mut ui, anthropic, false).unwrap();
-        assert!(ui.consent);
-        assert!(!ui.cloud_enabled);
+        assert!(ui.cloud_enabled);
+        assert_eq!(active_coaching_label(&ui), "Anthropic coaching");
         assert!(ui.credentials.openai.is_none());
         assert!(ui.credentials.anthropic.is_none());
     }
@@ -1735,6 +2226,7 @@ mod tests {
             update_note: format!("installed {} · Enter checks", update::current_version()),
             update_offer: None,
             confirm_install: false,
+            help: false,
         });
         let screen = rendered(&ui, 100, 36);
         assert!(screen.contains("SETTINGS"));
@@ -1746,6 +2238,207 @@ mod tests {
         assert!(screen.contains("Ctrl-X forget"));
         assert!(screen.contains("Updates"));
         assert!(screen.contains(update::current_version()));
+    }
+    #[test]
+    fn settings_help_keeps_selection_and_unsaved_edits_without_revealing_key() {
+        let mut editor = settings_editor(Settings::default());
+        editor.field = 6;
+        editor.draft.solver_feedback = true;
+        editor.key = "sk-private-value".into();
+        assert!(editor.handle_help_key(KeyCode::Char('?')));
+        assert!(editor.help);
+        let mut ui = ui(2);
+        ui.settings = Some(editor);
+        let screen = rendered(&ui, 80, 30);
+        assert!(screen.contains("SETTINGS HELP · Solver feedback"));
+        assert!(screen.contains("eligible heads-up river"));
+        assert!(!screen.contains("sk-private-value"));
+        let editor = ui.settings.as_mut().unwrap();
+        assert!(editor.handle_help_key(KeyCode::Esc));
+        assert!(!editor.help);
+        assert_eq!(editor.field, 6);
+        assert!(editor.draft.solver_feedback);
+        assert_eq!(editor.key, "sk-private-value");
+        for field in 0..=11 {
+            assert!(!settings_help(field).1.is_empty());
+        }
+    }
+    #[test]
+    fn disabling_solver_restores_retained_provider_coaching() {
+        let mut ui = ui(2);
+        while ui.session.view().to_act != Some(hero()) {
+            ui.session.step_bot().unwrap();
+        }
+        let action = ui.session.observation(hero()).unwrap().check_call();
+        let decision = ui.session.submit(action).unwrap().clone();
+        let mut provider = local_feedback(&decision);
+        provider.explanation = "Provider coaching retained".into();
+        provider.evidence_basis = "heuristic".into();
+        let mut solver = provider.clone();
+        solver.explanation = "Solver grade retained".into();
+        solver.evidence_basis = "solver".into();
+        ui.session.settings.solver_feedback = true;
+        ui.baseline_feedback = Some(provider.clone());
+        ui.feedback = Some(solver);
+        ui.solver_feedback = true;
+        ui.provider_feedback = true;
+        let mut updated = ui.session.settings.clone();
+        updated.solver_feedback = false;
+        apply_saved_settings(&mut ui, updated, false).unwrap();
+        assert!(!ui.solver_feedback);
+        assert!(ui.provider_feedback);
+        assert_eq!(
+            ui.feedback.as_ref().unwrap().explanation,
+            "Provider coaching retained"
+        );
+        assert_eq!(
+            ui.baseline_feedback.as_ref().unwrap().explanation,
+            "Provider coaching retained"
+        );
+    }
+
+    #[test]
+    fn stale_solver_result_cannot_replace_current_coaching() {
+        let mut ui = ui(2);
+        while ui.session.view().to_act != Some(hero()) {
+            ui.session.step_bot().unwrap();
+        }
+        let action = ui.session.observation(hero()).unwrap().check_call();
+        let decision = ui.session.submit(action).unwrap().clone();
+        let local = local_feedback(&decision);
+        let mut stale = local.clone();
+        stale.evidence_basis = "solver".into();
+        ui.session.settings.solver_feedback = true;
+        ui.baseline_feedback = Some(local.clone());
+        ui.feedback = Some(local);
+        let store = Store {
+            root: std::env::temp_dir().join("openfelt-stale-solver-test-no-write"),
+        };
+        assert!(!ui.accept_solver_result(
+            decision.observation.hand_id,
+            decision.observation.revision + 1,
+            Ok(stale),
+            &store
+        ));
+        assert!(!ui.solver_feedback);
+        assert_ne!(ui.feedback.as_ref().unwrap().evidence_basis, "solver");
+    }
+
+    #[test]
+    fn play_persists_late_feedback_after_hand_without_provider_request() {
+        let root = std::env::temp_dir().join(format!(
+            "openfelt-play-late-review-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let store = Store { root: root.clone() };
+        let mut ui = ui(2);
+        ui.session.settings.practice_pace = PracticePace::Play;
+        while ui.session.view().to_act != Some(hero()) {
+            ui.session.step_bot().unwrap();
+        }
+        let decision = ui.session.submit(Action::Fold).unwrap().clone();
+        ui.session.continue_hand();
+        assert!(ui.session.finished());
+        ui.save_progress(&store);
+        let mut cloud = local_feedback(&decision);
+        cloud.assessment = "uncertain".into();
+        cloud.explanation = "Review the price and remaining stack.".into();
+        cloud.concept = "Decision review".into();
+        cloud.assumptions.clear();
+        cloud.alternative_action = None;
+        assert!(provider::validate_feedback(&cloud, &decision).is_ok());
+        ui.accept_provider_result(
+            decision,
+            Ok(provider::ProviderResult {
+                feedback: cloud,
+                input_tokens: 4,
+                output_tokens: 6,
+            }),
+            &store,
+        );
+        assert!(ui.review_changed);
+        ui.save_progress(&store);
+        assert!(ui.replay_persisted());
+        let archive = super::super::replay::Archive::load(&root).unwrap();
+        assert_eq!(archive.hands.len(), 1);
+        assert_eq!(
+            archive.hands[0].decisions[0].feedback.explanation,
+            "Review the price and remaining stack."
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replay_practice_progress_survives_resuming_table_and_next_decision() {
+        let root = std::env::temp_dir().join(format!(
+            "openfelt-replay-progress-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let store = Store { root: root.clone() };
+        let mut ui = ui(2);
+        ui.save_progress(&store);
+        let mut persisted = store.progress().unwrap();
+        persisted.drills.insert(
+            "pot_odds".into(),
+            super::super::storage::DrillProgress {
+                attempts: 1,
+                correct: 1,
+                completed_sets: 1,
+            },
+        );
+        store.save("progress.json", &persisted).unwrap();
+        ui.sync_practice_progress(&store);
+        while ui.session.view().to_act != Some(hero()) {
+            ui.session.step_bot().unwrap();
+        }
+        let decision = ui.session.submit(Action::Fold).unwrap().clone();
+        let feedback = local_feedback(&decision);
+        ui.progress.decisions += 1;
+        ui.progress
+            .note_review(&feedback.concept, &feedback.assessment);
+        ui.save_progress(&store);
+        let after = store.progress().unwrap();
+        assert_eq!(after.decisions, 1);
+        assert_eq!(after.drills["pot_odds"].completed_sets, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn solver_and_provider_explanations_remain_separate_in_review() {
+        let mut ui = ui(2);
+        while ui.session.view().to_act != Some(hero()) {
+            ui.session.step_bot().unwrap();
+        }
+        let action = ui.session.observation(hero()).unwrap().check_call();
+        let decision = ui.session.submit(action).unwrap().clone();
+        let mut provider = local_feedback(&decision);
+        provider.explanation = "Provider coaching details stay available".into();
+        let mut solver = provider.clone();
+        solver.explanation = "Solver numerical assessment is primary".into();
+        solver.evidence_basis = "solver".into();
+        solver.alternative_action = Some("Use the solver's best action".into());
+        solver.assumptions = vec!["Modeled ranges and sizes".into()];
+        ui.session.settings.solver_feedback = true;
+        ui.baseline_feedback = Some(provider);
+        ui.feedback = Some(solver);
+        ui.solver_feedback = true;
+        ui.provider_feedback = true;
+        let compact = rendered(&ui, 100, 40);
+        assert!(compact.contains("Solver numerical assessment"));
+        assert!(compact.contains("Use the solver's best action"));
+        assert!(compact.contains("Solver · modeled ranges"));
+        ui.deep = true;
+        let expanded = rendered(&ui, 100, 40);
+        assert!(expanded.contains("SOLVER ANALYSIS"));
+        ui.deep_scroll = 12;
+        let lower = rendered(&ui, 100, 40);
+        assert!(lower.contains("COACHING EXPLANATION"));
+        assert!(
+            expanded_review_copy(&ui, ui.session.coaching.as_ref().unwrap())
+                .contains("Provider coaching details")
+        );
     }
     #[test]
     fn api_key_paste_keeps_x_and_provider() {
@@ -1777,6 +2470,7 @@ mod tests {
             update_note: "installed".into(),
             update_offer: None,
             confirm_install: false,
+            help: false,
         };
         let mut status = String::new();
         let store = FakeStore;
@@ -1826,6 +2520,7 @@ mod tests {
             update_note: "installed".into(),
             update_offer: None,
             confirm_install: false,
+            help: false,
         };
         editor.switch_provider(CoachingMode::Anthropic, "Missing".into());
         assert!(editor.key.is_empty());
@@ -1867,8 +2562,9 @@ mod tests {
         assert!(text.contains("Enter continue"));
         ui.deep = true;
         let text = rendered(&ui, 80, 30);
-        assert!(text.contains("Legal call:"));
-        assert!(text.contains("Contestable pot assumes"));
+        let full = expanded_review_copy(&ui, ui.session.coaching.as_ref().unwrap());
+        assert!(full.contains("Legal call:"));
+        assert!(full.contains("Contestable pot assumes"));
         assert!(text.contains("Enter continue"));
         assert!(!text.contains("[hidden]"));
 
@@ -1878,8 +2574,11 @@ mod tests {
         );
         let text = rendered(&ui, 80, 30);
         assert!(!text.contains("FULL_FEEDBACK_TAIL"));
-        for _ in 0..20 {
+        for _ in 0..400 {
             assert!(scroll_deep(&mut ui.deep_scroll, KeyCode::PageDown));
+            if rendered(&ui, 80, 30).contains("FULL_FEEDBACK_TAIL") {
+                break;
+            }
         }
         let text = rendered(&ui, 80, 30);
         assert!(text.contains("FULL_FEEDBACK_TAIL"));
@@ -1938,7 +2637,10 @@ mod tests {
         assert_eq!(ui.feedback.as_ref().unwrap().assessment, assessment);
         let expanded = rendered(&ui, 100, 36);
         assert!(expanded.contains("TOPIC"));
-        assert!(expanded.contains("First line explains the price"));
+        assert!(
+            expanded_review_copy(&ui, ui.session.coaching.as_ref().unwrap())
+                .contains("First line explains the price")
+        );
         assert!(!expanded.contains("Full reasoning shown above"));
     }
 
@@ -1994,14 +2696,14 @@ mod tests {
         let mut feedback = local_feedback(decision);
         feedback.assessment = "reasonable".into();
         assert_eq!(
-            review_presentation(Some(&feedback), false, false),
+            review_presentation(Some(&feedback), false, false, false, false, false, false),
             (
                 Some(crate::trainer::table_ui::ReviewTone::Good),
                 Some("Local guidance · heuristic")
             )
         );
         assert_eq!(
-            review_presentation(Some(&feedback), false, true),
+            review_presentation(Some(&feedback), false, true, false, false, false, false),
             (
                 Some(crate::trainer::table_ui::ReviewTone::Uncertain),
                 Some("Awaiting provider heuristic")
@@ -2009,12 +2711,12 @@ mod tests {
         );
         feedback.assessment = "reconsider".into();
         assert_eq!(
-            review_presentation(Some(&feedback), false, false).0,
+            review_presentation(Some(&feedback), false, false, false, false, false, false).0,
             Some(crate::trainer::table_ui::ReviewTone::Reconsider)
         );
         feedback.assessment = "uncertain".into();
         assert_eq!(
-            review_presentation(Some(&feedback), true, false),
+            review_presentation(Some(&feedback), true, false, false, false, false, false),
             (
                 Some(crate::trainer::table_ui::ReviewTone::Uncertain),
                 Some("AI suggestion · heuristic")

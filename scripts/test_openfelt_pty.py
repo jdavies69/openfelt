@@ -20,12 +20,14 @@ ANSI = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 class Game:
-    def __init__(self, root, *args):
+    def __init__(self, root, *args, test_env=None):
         self.root = Path(root)
         self.master, slave = pty.openpty()
         self.resize(80, 30)
         env = dict(os.environ)
         env.pop("OPENAI_API_KEY", None)
+        env.pop("ANTHROPIC_API_KEY", None)
+        env.update(test_env or {})
         env["TERM"] = "xterm-256color"
 
         def terminal_session():
@@ -117,7 +119,8 @@ with tempfile.TemporaryDirectory(prefix="openfelt-pty-") as root:
     while b"BOOKMARKED" not in ANSI.sub(b"", g.output) and time.monotonic() < deadline:
         g.read(0.1)
     assert b"BOOKMARKED" in ANSI.sub(b"", g.output)
-    g.send("\x1b\x1b")
+    g.send("\x1b")
+    g.send("\x1b")
     assert g.process.poll() is None, "replay must return to the same live session"
     g.quit()
     cash = [json.loads(line) for line in (g.root / "cash-events.jsonl").read_text().splitlines()]
@@ -139,13 +142,112 @@ with tempfile.TemporaryDirectory(prefix="openfelt-pty-") as root:
     g.quit()
     print("PASS: settings opens and safely returns to the live table")
 
-    g = Game(Path(root) / "missing-key", "--coaching", "openai", "--model", "fixture-model")
-    assert b"ENABLE OPTIONAL CLOUD COACHING" in ANSI.sub(b"", g.output)
-    g.send("\rC")
-    assert len(g.decisions()) == 1
-    assert b"OPENAI_API_KEY" in ANSI.sub(b"", g.output)
+    g = Game(Path(root) / "solver-setting")
+    g.send("s")
+    g.send("\x1b[B" * 6)
+    g.send("?")
+    help_text = re.sub(rb"\s+", b"", ANSI.sub(b"", g.output))
+    assert b"SETTINGSHELP" in help_text
+    assert b"Solverfeedback" in help_text
+    g.send("\x1b")
+    g.send("\x1b[C")
+    g.send("?")
+    g.send("?")
+    g.send("\x1b[B" * 3)
     g.send("\r")
+    saved = json.loads((g.root / "settings.json").read_text())
+    assert saved["solver_feedback"] is True, "help must preserve the selected setting and draft"
+    g.send("C")
+    assert len(g.decisions()) == 1
+    g.output = b""
+    g.send("s")
+    assert b"SETTINGS" in ANSI.sub(b"", g.output), "settings must open during paused feedback"
+    g.send("\x1b")
     g.quit()
-    print("PASS: explicit cloud consent, missing key permits play, no paid requests")
+    g = Game(Path(root) / "solver-setting")
+    g.send("s")
+    g.send("\x1b[B" * 6)
+    g.send("\x1b[D")
+    g.send("\x1b[B" * 3)
+    g.send("\r")
+    saved = json.loads((g.root / "settings.json").read_text())
+    assert saved["solver_feedback"] is False, "solver preference must persist across restarts"
+    g.quit()
+    print("PASS: selected-setting help preserves edits; solver On/Off persists across restarts")
+
+    play_root = Path(root) / "play-pace"
+    g = Game(play_root)
+    g.send("s")
+    g.send("\x1b[B" * 7)
+    g.send("?")
+    assert b"Practicepace" in re.sub(rb"\s+", b"", ANSI.sub(b"", g.output))
+    g.send("\x1b")
+    g.send("\x1b[C")
+    g.send("\x1b[B" * 2)
+    g.send("\r")
+    assert json.loads((play_root / "settings.json").read_text())["practice_pace"] == "play"
+    g.send("f")
+    deadline = time.monotonic() + 3
+    while not (play_root / "completed-hands.jsonl").exists() and time.monotonic() < deadline:
+        g.read(0.1)
+    assert (play_root / "completed-hands.jsonl").exists(), "Play must finish without coaching Enter"
+    assert len(g.decisions()) == 1
+    g.send("r")
+    assert b"COMPLETED HANDS" in ANSI.sub(b"", g.output)
+    g.send("\r")
+    g.send("p")
+    assert b"PRACTICE" in ANSI.sub(b"", g.output)
+    for _ in range(3):
+        g.send("1")
+        g.send("\r")
+    drill_stats = json.loads((play_root / "progress.json").read_text())["drills"]
+    assert sum(item["attempts"] for item in drill_stats.values()) == 3
+    g.send("\x1b")
+    g.send("b")
+    assert len(json.loads((play_root / "bookmarks.json").read_text())) == 1
+    g.send("\x1b")
+    g.send("\x1b")
+    g.send("\r")
+    for _ in range(10):
+        g.read(0.5)
+        g.send("c")
+        if len(g.decisions()) >= 2:
+            break
+        # A bot can fold before hero acts; advance that completed hand.
+        g.send("\r")
+    assert len(g.decisions()) >= 2
+    assert json.loads((play_root / "progress.json").read_text())["drills"] == drill_stats, "playing must preserve completed replay drills"
+    g.quit()
+    g = Game(play_root)
+    g.send("f")
+    g.read(0.3)
+    hands = (play_root / "completed-hands.jsonl").read_text().splitlines()
+    assert len(hands) >= 2, "Play preference must survive restart"
+    g.quit()
+    print("PASS: Play pace persists; hand ends without a pause; replay practice returns to bookmark")
+
+    # A temporary data directory does not isolate the OS credential store.
+    # An empty environment credential fails validation before any Keychain or
+    # HTTP access. It lets us test activation/persistence without a real key.
+    cloud_root = Path(root) / "cloud-persistent"
+    g = Game(cloud_root, "--coaching", "openai", "--model", "fixture-model",
+             "--save-settings", test_env={"OPENAI_API_KEY": ""})
+    assert b"ENABLE OPTIONAL CLOUD COACHING" not in ANSI.sub(b"", g.output)
+    g.send("C")
+    assert len(g.decisions()) == 1
+    g.quit()
+    assert json.loads((cloud_root / "settings.json").read_text())["coaching"] == "openai"
+    g = Game(cloud_root, test_env={"OPENAI_API_KEY": ""})
+    assert b"ENABLE OPTIONAL CLOUD COACHING" not in ANSI.sub(b"", g.output)
+    assert b"OpenAI coaching" in ANSI.sub(b"", g.output)
+    g.send("s")
+    g.send("\x1b[C" * 2)  # OpenAI -> Anthropic -> Local
+    g.send("\x1b[B" * 9)
+    g.send("\r")
+    assert json.loads((cloud_root / "settings.json").read_text())["coaching"] == "local"
+    g.send("C")
+    assert len(g.decisions()) == 2
+    g.quit()
+    print("PASS: cloud provider persists/activates on restart; selecting Local disables it")
 
 print("All OpenFelt PTY smoke tests passed.")
