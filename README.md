@@ -119,14 +119,19 @@ Run `openfelt-eval` for the committed, reproducible offline coaching corpus and 
 
 ## Local solver practice
 
+For feedback while playing, open **S → Solver feedback → On → Save and return**.
+The setting persists. Supported heads-up river decisions are reviewed locally in
+the normal post-decision panel with **Solver · modeled ranges** feedback. Other
+spots retain labeled heuristic teaching. See [live feedback and its assumptions](docs/solver/live-feedback.md).
+
 Run `openfelt --solver-practice`, or press **G** at the trainer table, for a
 heads-up river exercise with explicit hand ranges and betting options. Choose an
 action to see estimated EV loss and strategy frequency immediately after the
 local solve completes. No model or API key is involved. Custom weighted ranges
 and sizes can be supplied with `--solver-scenario path/to/scenario.json`.
 
-See [river practice and scenario format](docs/solver/README.md). This is a separate
-bounded training mode; regular multiway play still uses heuristic coaching.
+See [river practice and scenario format](docs/solver/README.md). The separate
+practice mode accepts custom scenarios; regular multiway play still uses heuristic coaching.
 
 ## Development and provenance
 

@@ -3,10 +3,12 @@ pub mod coaching;
 pub mod drills;
 pub mod evaluation;
 pub mod facts;
+pub mod live_solver;
 #[cfg(target_os = "macos")]
 pub mod macos_credentials;
 pub mod policy;
 pub mod provider;
+pub mod ranges;
 pub mod replay;
 pub mod replay_ui;
 pub mod solver;
@@ -160,7 +162,7 @@ impl Session {
             ProjectionAudience::Player(actor),
         )
         .map_err(|_| "Invalid player")?;
-        Observation::from_projection(
+        let mut observation = Observation::from_projection(
             &projection,
             self.hand.action_history.len() as u64,
             self.hand
@@ -168,7 +170,19 @@ impl Session {
                 .iter()
                 .map(|a| (a.seat, a.action))
                 .collect(),
-        )
+        )?;
+        observation.public_history = self
+            .hand
+            .action_history
+            .iter()
+            .map(|record| facts::PublicAction {
+                phase: record.phase,
+                seat: record.seat,
+                action: record.action,
+                wager_after: record.wager_after,
+            })
+            .collect();
+        Ok(observation)
     }
     pub fn submit(&mut self, action: Action) -> Result<&Decision, String> {
         if self.coaching.is_some() {
@@ -198,6 +212,25 @@ impl Session {
         self.coaching = None;
         self.frozen_view = None;
         self.settle();
+    }
+    /// Replace only the still-paused decision's replay feedback, never another hand.
+    pub fn record_solver_feedback(&mut self, feedback: &facts::Feedback) -> bool {
+        let Some(decision) = &self.coaching else {
+            return false;
+        };
+        if feedback.hand_id != decision.observation.hand_id
+            || feedback.revision != decision.observation.revision
+        {
+            return false;
+        }
+        let Some(record) = self.replay_decisions.last_mut() else {
+            return false;
+        };
+        if record.decision != *decision {
+            return false;
+        }
+        record.feedback = feedback.clone();
+        true
     }
     pub fn step_bot(&mut self) -> Result<bool, String> {
         if self.coaching.is_some() || self.finished() {

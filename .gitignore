@@ -55,5 +55,6 @@ __pycache__/
 /progress.json
 **/decisions.jsonl
 **/cloud-feedback.jsonl
+**/solver-feedback.jsonl
 **/cash-events.jsonl
 **/usage.jsonl

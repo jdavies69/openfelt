@@ -140,6 +140,38 @@ with tempfile.TemporaryDirectory(prefix="openfelt-pty-") as root:
     g.quit()
     print("PASS: settings opens and safely returns to the live table")
 
+    g = Game(Path(root) / "solver-setting")
+    g.send("s")
+    g.send("\x1b[B" * 6)
+    g.send("?")
+    assert b"SETTINGS HELP" in ANSI.sub(b"", g.output)
+    assert b"Solver feedback" in ANSI.sub(b"", g.output)
+    g.send("\x1b")
+    g.send("\x1b[C")
+    g.send("?")
+    g.send("?")
+    g.send("\x1b[B" * 2)
+    g.send("\r")
+    saved = json.loads((g.root / "settings.json").read_text())
+    assert saved["solver_feedback"] is True, "help must preserve the selected setting and draft"
+    g.send("C")
+    assert len(g.decisions()) == 1
+    g.output = b""
+    g.send("s")
+    assert b"SETTINGS" in ANSI.sub(b"", g.output), "settings must open during paused feedback"
+    g.send("\x1b")
+    g.quit()
+    g = Game(Path(root) / "solver-setting")
+    g.send("s")
+    g.send("\x1b[B" * 6)
+    g.send("\x1b[D")
+    g.send("\x1b[B" * 2)
+    g.send("\r")
+    saved = json.loads((g.root / "settings.json").read_text())
+    assert saved["solver_feedback"] is False, "solver preference must persist across restarts"
+    g.quit()
+    print("PASS: selected-setting help preserves edits; solver On/Off persists across restarts")
+
     # A temporary data directory does not isolate the OS credential store.
     # Decline cloud access here; mocked Rust tests cover missing credentials.
     g = Game(Path(root) / "cloud-declined", "--coaching", "openai", "--model", "fixture-model")

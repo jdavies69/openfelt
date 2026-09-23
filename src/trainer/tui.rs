@@ -1,6 +1,6 @@
 use super::{
     facts::{local_feedback, Feedback},
-    hero,
+    hero, live_solver,
     provider::{self, CredentialTest, Pending, Provider, SystemKeyring, Usage},
     storage::{CoachingMode, Progress, Settings, Store},
     update::{self, AvailableUpdate, UpdateDone, UpdateMessage},
@@ -20,8 +20,63 @@ use ratatui::{
 };
 use std::{
     io,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+        Arc, Mutex,
+    },
+    thread,
     time::{Duration, Instant},
 };
+
+struct PendingSolver {
+    hand_id: u64,
+    revision: u64,
+    cancel: Arc<AtomicBool>,
+    result: Receiver<Result<Feedback, String>>,
+}
+static LIVE_SOLVER_GATE: Mutex<()> = Mutex::new(());
+impl PendingSolver {
+    fn start(decision: super::facts::Decision) -> Self {
+        let hand_id = decision.observation.hand_id;
+        let revision = decision.observation.revision;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (sender, result) = mpsc::channel();
+        thread::spawn(move || {
+            let _gate = LIVE_SOLVER_GATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let response = if worker_cancel.load(Ordering::Relaxed) {
+                Err("Solver cancelled".into())
+            } else {
+                live_solver::solve_decision(&decision, &worker_cancel)
+            };
+            let _ = sender.send(response);
+        });
+        Self {
+            hand_id,
+            revision,
+            cancel,
+            result,
+        }
+    }
+    fn poll(&self) -> Option<Result<Feedback, String>> {
+        match self.result.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(Err("Solver worker stopped".into())),
+        }
+    }
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+impl Drop for PendingSolver {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
 
 enum Input {
     Play,
@@ -41,8 +96,22 @@ struct SettingsEditor {
     update_note: String,
     update_offer: Option<AvailableUpdate>,
     confirm_install: bool,
+    help: bool,
 }
 impl SettingsEditor {
+    fn handle_help_key(&mut self, code: KeyCode) -> bool {
+        if self.help {
+            if matches!(code, KeyCode::Esc | KeyCode::Char('?')) {
+                self.help = false;
+            }
+            return true;
+        }
+        if code == KeyCode::Char('?') {
+            self.help = true;
+            return true;
+        }
+        false
+    }
     fn switch_provider(&mut self, coaching: CoachingMode, source: String) {
         self.draft.coaching = coaching;
         self.source = source;
@@ -109,6 +178,10 @@ struct Ui {
     session: Session,
     input: Input,
     feedback: Option<Feedback>,
+    baseline_feedback: Option<Feedback>,
+    solver_pending: Option<PendingSolver>,
+    solver_feedback: bool,
+    solver_note: Option<String>,
     pending: Option<Pending>,
     status: String,
     deep: bool,
@@ -145,6 +218,10 @@ pub fn run(
         session: Session::new(settings)?,
         input: Input::Play,
         feedback: None,
+        baseline_feedback: None,
+        solver_pending: None,
+        solver_feedback: false,
+        solver_note: None,
         pending: None,
         status: "F fold · C check/call · R raise · A all-in · G river practice · ? help".into(),
         deep: false,
@@ -182,6 +259,10 @@ pub fn run(
     let mut redraw = true;
     let mut last_size = None;
     loop {
+        if let Some(result) = ui.solver_pending.as_ref().and_then(PendingSolver::poll) {
+            let pending = ui.solver_pending.take().expect("polled solver pending");
+            redraw |= ui.accept_solver_result(pending.hand_id, pending.revision, result, &store);
+        }
         if let Some(solver) = &mut ui.solver {
             redraw |= solver.tick();
         }
@@ -232,10 +313,17 @@ pub fn run(
                         if let Err(e) = store.append("cloud-feedback.jsonl", &result.feedback) {
                             ui.status = e;
                         } else {
-                            ui.status =
-                                "Provider heuristic received · Enter continues · ? details".into();
+                            ui.status = if ui.solver_feedback {
+                                "Provider coaching ready too · solver grade retained · ? both"
+                                    .into()
+                            } else {
+                                "Provider heuristic received · Enter continues · ? details".into()
+                            };
                         }
-                        ui.feedback = Some(result.feedback);
+                        ui.baseline_feedback = Some(result.feedback.clone());
+                        if !ui.solver_feedback {
+                            ui.feedback = Some(result.feedback);
+                        }
                         ui.provider_feedback = true;
                     }
                 }
@@ -303,6 +391,10 @@ pub fn run(
             other => other,
         };
         if let Some(mut editor) = ui.settings.take() {
+            if editor.handle_help_key(key.code) {
+                ui.settings = Some(editor);
+                continue;
+            }
             let mut close = false;
             match key.code {
                 KeyCode::Esc => {
@@ -311,7 +403,7 @@ pub fn run(
                     close = true;
                 }
                 KeyCode::Up => editor.field = editor.field.saturating_sub(1),
-                KeyCode::Down => editor.field = (editor.field + 1).min(8),
+                KeyCode::Down => editor.field = (editor.field + 1).min(11),
                 _ if editor.field == 2
                     && apply_api_key_field(&mut editor, &mut ui.status, key, &SystemKeyring) =>
                 {
@@ -383,7 +475,18 @@ pub fn run(
                         super::policy::Profile::Competent => super::policy::Profile::Fundamentals,
                     }
                 }
-                KeyCode::Enter if editor.field == 6 => {
+                KeyCode::Left | KeyCode::Right | KeyCode::Enter if editor.field == 6 => {
+                    editor.draft.solver_feedback = !editor.draft.solver_feedback;
+                    ui.status = format!(
+                        "Solver feedback {} · Save and return to apply",
+                        if editor.draft.solver_feedback {
+                            "On"
+                        } else {
+                            "Off"
+                        }
+                    );
+                }
+                KeyCode::Enter if editor.field == 7 => {
                     if !editor.confirm_test {
                         editor.confirm_test = true;
                         ui.status =
@@ -422,7 +525,7 @@ pub fn run(
                         editor.confirm_test = false;
                     }
                 }
-                KeyCode::Enter if editor.field == 8 => {
+                KeyCode::Enter if editor.field == 9 => {
                     if ui.update_task.is_some() {
                         ui.status = "Update already in progress".into();
                     } else if !updates_allowed(&ui) {
@@ -458,7 +561,7 @@ pub fn run(
                         }
                     }
                 }
-                KeyCode::Enter if editor.field == 7 => {
+                KeyCode::Enter if editor.field == 8 => {
                     let credentials_changed = !editor.key.is_empty()
                         || editor.draft.coaching != ui.session.settings.coaching;
                     if credentials_changed {
@@ -547,7 +650,7 @@ pub fn run(
             }
             continue;
         }
-        if code == KeyCode::Char('s') && ui.session.coaching.is_none() {
+        if code == KeyCode::Char('s') {
             ui.settings = Some(settings_editor(ui.session.settings.clone()));
             continue;
         }
@@ -602,8 +705,10 @@ pub fn run(
                 }
                 KeyCode::Enter => {
                     ui.pending = None;
+                    ui.cancel_solver_feedback();
                     ui.session.continue_hand();
                     ui.feedback = None;
+                    ui.baseline_feedback = None;
                     ui.provider_feedback = false;
                     ui.deep = false;
                     ui.deep_scroll = 0;
@@ -768,18 +873,21 @@ pub fn run(
         if let Some(action) = action {
             match ui.session.submit(action) {
                 Ok(d) => {
-                    let f = local_feedback(d);
+                    let decision = d.clone();
+                    let f = local_feedback(&decision);
                     ui.progress.decisions += 1;
                     ui.progress.note_review(&f.concept, &f.assessment);
                     *ui.progress.concepts.entry(f.concept.clone()).or_default() += 1;
-                    if let Err(e) = store.decision(d, &f) {
+                    if let Err(e) = store.decision(&decision, &f) {
                         ui.status = e;
                     } else {
                         ui.status =
                             "Decision accepted · hand paused · Enter continues · ? details".into();
                     }
                     ui.refresh_practice(&store);
+                    ui.baseline_feedback = Some(f.clone());
                     ui.feedback = Some(f);
+                    ui.begin_solver_feedback(decision);
                     if ui.cloud_enabled {
                         ui.request(&store);
                     }
@@ -789,6 +897,7 @@ pub fn run(
         }
     }
     ui.pending = None;
+    ui.cancel_solver_feedback();
     ui.update_task = None;
     ui.save_progress(&store);
     let restart = ui.restart_notice.clone();
@@ -818,7 +927,21 @@ fn apply_saved_settings(
     ui.cloud_enabled = keep_cloud_enabled;
     ui.consent = selected_provider(ui.session.settings.coaching).is_some() && !keep_cloud_enabled;
     ui.pending = None;
-    ui.provider_feedback = false;
+    if !same_cloud_target || reset_session {
+        ui.provider_feedback = false;
+        ui.baseline_feedback = None;
+    }
+    ui.cancel_solver_feedback();
+    if let Some(decision) = ui.session.coaching.clone() {
+        let baseline = ui
+            .baseline_feedback
+            .clone()
+            .unwrap_or_else(|| local_feedback(&decision));
+        ui.session.record_solver_feedback(&baseline);
+        ui.baseline_feedback = Some(baseline.clone());
+        ui.feedback = Some(baseline);
+        ui.begin_solver_feedback(decision);
+    }
     Ok(())
 }
 
@@ -845,11 +968,16 @@ fn skip_cloud_for_session(ui: &mut Ui) {
 }
 
 fn active_coaching_label(ui: &Ui) -> String {
-    match selected_provider(ui.session.settings.coaching) {
+    let base = match selected_provider(ui.session.settings.coaching) {
         Some(provider) if ui.cloud_enabled => format!("{} coaching", provider_label(provider)),
         Some(provider) => format!("local · {} selected", provider_label(provider)),
         None if ui.session.settings.coaching == CoachingMode::Off => "coaching off".into(),
         None => "local coaching".into(),
+    };
+    if ui.session.settings.solver_feedback {
+        format!("solver on · {base}")
+    } else {
+        base
     }
 }
 
@@ -871,6 +999,77 @@ fn scroll_deep(scroll: &mut u16, code: KeyCode) -> bool {
     true
 }
 impl Ui {
+    fn accept_solver_result(
+        &mut self,
+        hand_id: u64,
+        revision: u64,
+        result: Result<Feedback, String>,
+        store: &Store,
+    ) -> bool {
+        let current = self.session.coaching.as_ref().is_some_and(|decision| {
+            decision.observation.hand_id == hand_id && decision.observation.revision == revision
+        });
+        if !self.session.settings.solver_feedback || !current {
+            return false;
+        }
+        match result {
+            Ok(feedback)
+                if feedback.hand_id == hand_id
+                    && feedback.revision == revision
+                    && feedback.evidence_basis == "solver" =>
+            {
+                if self.session.record_solver_feedback(&feedback) {
+                    self.solver_feedback = true;
+                    self.solver_note = Some("Solver · modeled ranges".into());
+                    self.status = "Solver feedback ready · modeled ranges · ? both".into();
+                    if let Err(error) = store.append("solver-feedback.jsonl", &feedback) {
+                        self.status = error;
+                    }
+                    self.feedback = Some(feedback);
+                }
+            }
+            Ok(_) => {
+                self.solver_note = Some("Solver result rejected; coaching shown".into());
+                self.status = self.solver_note.clone().unwrap_or_default();
+            }
+            Err(error) => {
+                self.solver_note = Some(format!("Solver unavailable: {error}; coaching shown"));
+                self.status = self.solver_note.clone().unwrap_or_default();
+            }
+        }
+        true
+    }
+
+    fn cancel_solver_feedback(&mut self) {
+        self.solver_pending = None;
+        self.solver_feedback = false;
+        self.solver_note = None;
+    }
+
+    /// Returns true when a supported local solve was started for this exact decision.
+    fn begin_solver_feedback(&mut self, decision: super::facts::Decision) -> bool {
+        self.cancel_solver_feedback();
+        if !self.session.settings.solver_feedback {
+            return false;
+        }
+        match live_solver::eligibility(&decision) {
+            Ok(()) => {
+                self.solver_pending = Some(PendingSolver::start(decision));
+                self.solver_note =
+                    Some("Solver calculating · local heuristic shown meanwhile".into());
+                self.status = self.solver_note.clone().unwrap_or_default();
+                true
+            }
+            Err(reason) => {
+                self.solver_note = Some(format!(
+                    "Solver unavailable: {reason}; local heuristic shown"
+                ));
+                self.status = self.solver_note.clone().unwrap_or_default();
+                false
+            }
+        }
+    }
+
     fn request(&mut self, store: &Store) {
         let Some(d) = self.session.coaching.clone() else {
             return;
@@ -1019,6 +1218,22 @@ fn replay_available(ui: &Ui) -> bool {
 fn ui_settings_placeholder() -> Settings {
     Settings::default()
 }
+fn settings_help(field: usize) -> (&'static str, &'static str) {
+    match field {
+        0 => ("Provider", "Select local, OpenAI, or Anthropic coaching. Local needs no key or network. A cloud choice still needs session consent before requests. Changes apply when you save."),
+        1 => ("Model", "Choose a listed provider model with Left/Right, or press E to type a custom model ID. This matters only for cloud coaching. Changes apply when you save."),
+        2 => ("API key", "Type or paste a provider key for optional cloud coaching. Ctrl-V changes visibility and Ctrl-X confirms forgetting a saved key. Help never displays the key. A new key is stored only when you save."),
+        3 => ("Session limit", "Maximum optional cloud coaching requests in one session. Left/Right adjusts the limit; it does not affect local solver calculations. Save to apply."),
+        4 => ("Table", "Choose 2–9 seats with Left/Right. Blinds are shown here and can be changed with CLI flags. Save to apply the seat count to a new session."),
+        5 => ("Opponents", "Choose a heuristic opponent profile with Left/Right. These bots do not use the solver. Save to apply."),
+        6 => ("Solver feedback", "Turn on local solver feedback for eligible heads-up river decisions. Existing coaching remains available in the expanded ? review. Unsupported decisions keep their coaching explanation. Off restores that explanation. Save to apply; no key or cloud request is needed for solver work."),
+        7 => ("Test key", "Press Enter twice to make one explicit, potentially billable provider test request. This does not turn on solver feedback or save settings."),
+        8 => ("Save and return", "Validate and save these settings. Unsaved edits remain in this screen until saved. Solver feedback On/Off applies to a paused decision after saving."),
+        9 => ("Updates", "Check for a published release between hands. Installing an offered release requires a second Enter. This does not change solver or coaching settings."),
+        10 => ("Cloud limits", "Shows the configured model output limit, budget, and pricing date. Change these with CLI flags, then save settings. Local solver work uses no provider budget."),
+        _ => ("Status", "Shows the latest setup or connection result. It does not expose your API key. Use Up/Down to return to an editable row."),
+    }
+}
 fn settings_editor(draft: Settings) -> SettingsEditor {
     let source = credential_source_label(draft.coaching, false);
     SettingsEditor {
@@ -1033,6 +1248,7 @@ fn settings_editor(draft: Settings) -> SettingsEditor {
         update_note: format!("installed {} · Enter checks", update::current_version()),
         update_offer: None,
         confirm_install: false,
+        help: false,
     }
 }
 
@@ -1136,6 +1352,18 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
         return;
     }
     if let Some(editor) = &ui.settings {
+        if editor.help {
+            let (heading, explanation) = settings_help(editor.field);
+            frame.render_widget(
+                Paragraph::new(format!("{explanation}\n\n? or Esc returns to the same setting. Unsaved edits are preserved."))
+                    .style(base)
+                    .wrap(Wrap { trim: true })
+                    .block(Block::default().borders(Borders::ALL)
+                        .title(format!("SETTINGS HELP · {heading}"))),
+                area,
+            );
+            return;
+        }
         let key = if editor.key.is_empty() {
             "(leave unchanged)".into()
         } else {
@@ -1161,6 +1389,14 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
                 editor.draft.seats, editor.draft.small_blind, editor.draft.big_blind
             ),
             format!("Opponents      {:?}", editor.draft.opponents.profile),
+            format!(
+                "Solver feedback  {} [←/→/Enter] · local HU river only",
+                if editor.draft.solver_feedback {
+                    "On"
+                } else {
+                    "Off"
+                }
+            ),
             if editor.confirm_test {
                 "Test key       CONFIRM billable request with Enter".into()
             } else {
@@ -1197,7 +1433,7 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
         super::table_ui::render_settings_panel(
             frame,
             area,
-            &format!("SETTINGS · credential: {}", editor.source),
+            &format!("SETTINGS · ? help selected · credential: {}", editor.source),
             &rows,
             editor.field,
         );
@@ -1221,15 +1457,25 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
             format!("Amount: {amount}\nEnter confirms · Esc cancels"),
         )
     } else if let Some(d) = &ui.session.coaching {
-        let explanation = if ui.session.settings.coaching == CoachingMode::Off {
-            "Coaching off. Your decision is accepted.".into()
-        } else if let Some(f) = &ui.feedback {
-            coaching_explanation(f)
-        } else {
-            "Coaching unavailable".into()
-        };
+        let explanation =
+            if ui.session.settings.coaching == CoachingMode::Off && !ui.solver_feedback {
+                if ui.session.settings.solver_feedback {
+                    format!(
+                        "Coaching is off. {}",
+                        ui.solver_note
+                            .as_deref()
+                            .unwrap_or("Solver review is pending.")
+                    )
+                } else {
+                    "Coaching off. Your decision is accepted.".into()
+                }
+            } else if let Some(f) = &ui.feedback {
+                coaching_explanation(f)
+            } else {
+                "Coaching unavailable".into()
+            };
         let details = if ui.deep {
-            format!(
+            let mut details = format!(
                 "\nTOPIC  {}\n{} · {}\nLegal call: {} chips. Contestable pot after call: {} chips.\n{}",
                 ui.feedback
                     .as_ref()
@@ -1240,12 +1486,45 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
                 d.facts.call_cost,
                 d.facts.contestable_pot_after_call,
                 d.facts.assumptions[0]
-            )
+            );
+            if ui.session.settings.solver_feedback {
+                details.push_str("\nSOLVER ANALYSIS — MODELED RANGES\n");
+                if ui.solver_feedback {
+                    if let Some(feedback) = &ui.feedback {
+                        details.push_str(&coaching_explanation(feedback));
+                        details.push('\n');
+                        details.push_str(&feedback.assumptions.join("\n"));
+                    }
+                } else {
+                    details.push_str(ui.solver_note.as_deref().unwrap_or("Solver not ready"));
+                }
+                details.push_str(if ui.session.settings.coaching == CoachingMode::Off {
+                    "\nCOACHING EXPLANATION — OFF\n"
+                } else if ui.provider_feedback {
+                    "\nCOACHING EXPLANATION — CLOUD PROVIDER HEURISTIC\n"
+                } else {
+                    "\nCOACHING EXPLANATION — LOCAL HEURISTIC\n"
+                });
+                if ui.session.settings.coaching == CoachingMode::Off {
+                    details.push_str("Coaching is off for this session.");
+                } else if let Some(baseline) = &ui.baseline_feedback {
+                    details.push_str(&coaching_explanation(baseline));
+                    details.push('\n');
+                    details.push_str(&baseline.assumptions.join("\n"));
+                } else {
+                    details.push_str("Coaching explanation unavailable");
+                }
+            }
+            details
         } else {
             String::new()
         };
         (
-            " AFTER YOUR DECISION ",
+            if ui.solver_feedback {
+                " AFTER YOUR DECISION · SOLVER "
+            } else {
+                " AFTER YOUR DECISION "
+            },
             structured_coaching_copy(
                 d,
                 &explanation,
@@ -1319,6 +1598,10 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui) {
         ui.feedback.as_ref(),
         ui.provider_feedback,
         ui.pending.is_some(),
+        ui.solver_feedback,
+        ui.solver_pending.is_some(),
+        ui.solver_note.is_some(),
+        ui.session.settings.coaching == CoachingMode::Off,
     );
     let active_coaching = active_coaching_label(ui);
     super::table_ui::render(
@@ -1369,17 +1652,51 @@ fn review_presentation(
     feedback: Option<&Feedback>,
     provider_feedback: bool,
     pending: bool,
+    solver_feedback: bool,
+    solver_pending: bool,
+    solver_note: bool,
+    coaching_off: bool,
 ) -> (Option<super::table_ui::ReviewTone>, Option<&'static str>) {
+    if solver_feedback {
+        return (
+            feedback.map(|f| super::table_ui::ReviewTone::from_assessment(&f.assessment)),
+            Some("Solver · modeled ranges · ? both explanations"),
+        );
+    }
+    if solver_pending {
+        return (
+            feedback.map(|f| super::table_ui::ReviewTone::from_assessment(&f.assessment)),
+            Some(if coaching_off {
+                "Solver calculating · coaching off"
+            } else if provider_feedback {
+                "AI heuristic · solver calculating"
+            } else {
+                "Local heuristic · solver calculating"
+            }),
+        );
+    }
     if pending {
         return (
             Some(super::table_ui::ReviewTone::Uncertain),
-            Some("Awaiting provider heuristic"),
+            Some(if solver_note {
+                "Solver unavailable · awaiting provider heuristic"
+            } else {
+                "Awaiting provider heuristic"
+            }),
         );
     }
     let tone =
         feedback.map(|feedback| super::table_ui::ReviewTone::from_assessment(&feedback.assessment));
     let source = feedback.map(|_| {
-        if provider_feedback {
+        if coaching_off && solver_note {
+            "Solver unavailable · coaching off"
+        } else if coaching_off {
+            "Coaching off"
+        } else if provider_feedback && solver_note {
+            "AI heuristic · solver unavailable"
+        } else if solver_note {
+            "Local heuristic · solver unavailable"
+        } else if provider_feedback {
             "AI suggestion · heuristic"
         } else {
             "Local guidance · heuristic"
@@ -1505,7 +1822,11 @@ pub fn humanize_coaching(copy: &str) -> String {
 }
 
 pub fn coaching_explanation(feedback: &Feedback) -> String {
-    humanize_coaching(&feedback.explanation)
+    if feedback.evidence_basis == "solver" {
+        normalize_paragraph(&feedback.explanation)
+    } else {
+        humanize_coaching(&feedback.explanation)
+    }
 }
 
 /// Compatibility alias for render-preview callers. Compact clipping is owned
@@ -1536,6 +1857,10 @@ mod tests {
             .unwrap(),
             input: Input::Play,
             feedback: None,
+            baseline_feedback: None,
+            solver_pending: None,
+            solver_feedback: false,
+            solver_note: None,
             pending: None,
             status: "Ready".into(),
             deep: false,
@@ -1761,6 +2086,7 @@ mod tests {
             update_note: format!("installed {} · Enter checks", update::current_version()),
             update_offer: None,
             confirm_install: false,
+            help: false,
         });
         let screen = rendered(&ui, 100, 36);
         assert!(screen.contains("SETTINGS"));
@@ -1772,6 +2098,123 @@ mod tests {
         assert!(screen.contains("Ctrl-X forget"));
         assert!(screen.contains("Updates"));
         assert!(screen.contains(update::current_version()));
+    }
+    #[test]
+    fn settings_help_keeps_selection_and_unsaved_edits_without_revealing_key() {
+        let mut editor = settings_editor(Settings::default());
+        editor.field = 6;
+        editor.draft.solver_feedback = true;
+        editor.key = "sk-private-value".into();
+        assert!(editor.handle_help_key(KeyCode::Char('?')));
+        assert!(editor.help);
+        let mut ui = ui(2);
+        ui.settings = Some(editor);
+        let screen = rendered(&ui, 80, 30);
+        assert!(screen.contains("SETTINGS HELP · Solver feedback"));
+        assert!(screen.contains("eligible heads-up river"));
+        assert!(!screen.contains("sk-private-value"));
+        let editor = ui.settings.as_mut().unwrap();
+        assert!(editor.handle_help_key(KeyCode::Esc));
+        assert!(!editor.help);
+        assert_eq!(editor.field, 6);
+        assert!(editor.draft.solver_feedback);
+        assert_eq!(editor.key, "sk-private-value");
+        for field in 0..=11 {
+            assert!(!settings_help(field).1.is_empty());
+        }
+    }
+    #[test]
+    fn disabling_solver_restores_retained_provider_coaching() {
+        let mut ui = ui(2);
+        while ui.session.view().to_act != Some(hero()) {
+            ui.session.step_bot().unwrap();
+        }
+        let action = ui.session.observation(hero()).unwrap().check_call();
+        let decision = ui.session.submit(action).unwrap().clone();
+        let mut provider = local_feedback(&decision);
+        provider.explanation = "Provider coaching retained".into();
+        provider.evidence_basis = "heuristic".into();
+        let mut solver = provider.clone();
+        solver.explanation = "Solver grade retained".into();
+        solver.evidence_basis = "solver".into();
+        ui.session.settings.solver_feedback = true;
+        ui.baseline_feedback = Some(provider.clone());
+        ui.feedback = Some(solver);
+        ui.solver_feedback = true;
+        ui.provider_feedback = true;
+        let mut updated = ui.session.settings.clone();
+        updated.solver_feedback = false;
+        apply_saved_settings(&mut ui, updated, false).unwrap();
+        assert!(!ui.solver_feedback);
+        assert!(ui.provider_feedback);
+        assert_eq!(
+            ui.feedback.as_ref().unwrap().explanation,
+            "Provider coaching retained"
+        );
+        assert_eq!(
+            ui.baseline_feedback.as_ref().unwrap().explanation,
+            "Provider coaching retained"
+        );
+    }
+
+    #[test]
+    fn stale_solver_result_cannot_replace_current_coaching() {
+        let mut ui = ui(2);
+        while ui.session.view().to_act != Some(hero()) {
+            ui.session.step_bot().unwrap();
+        }
+        let action = ui.session.observation(hero()).unwrap().check_call();
+        let decision = ui.session.submit(action).unwrap().clone();
+        let local = local_feedback(&decision);
+        let mut stale = local.clone();
+        stale.evidence_basis = "solver".into();
+        ui.session.settings.solver_feedback = true;
+        ui.baseline_feedback = Some(local.clone());
+        ui.feedback = Some(local);
+        let store = Store {
+            root: std::env::temp_dir().join("openfelt-stale-solver-test-no-write"),
+        };
+        assert!(!ui.accept_solver_result(
+            decision.observation.hand_id,
+            decision.observation.revision + 1,
+            Ok(stale),
+            &store
+        ));
+        assert!(!ui.solver_feedback);
+        assert_ne!(ui.feedback.as_ref().unwrap().evidence_basis, "solver");
+    }
+
+    #[test]
+    fn solver_and_provider_explanations_remain_separate_in_review() {
+        let mut ui = ui(2);
+        while ui.session.view().to_act != Some(hero()) {
+            ui.session.step_bot().unwrap();
+        }
+        let action = ui.session.observation(hero()).unwrap().check_call();
+        let decision = ui.session.submit(action).unwrap().clone();
+        let mut provider = local_feedback(&decision);
+        provider.explanation = "Provider coaching details stay available".into();
+        let mut solver = provider.clone();
+        solver.explanation = "Solver numerical assessment is primary".into();
+        solver.evidence_basis = "solver".into();
+        solver.alternative_action = Some("Use the solver's best action".into());
+        solver.assumptions = vec!["Modeled ranges and sizes".into()];
+        ui.session.settings.solver_feedback = true;
+        ui.baseline_feedback = Some(provider);
+        ui.feedback = Some(solver);
+        ui.solver_feedback = true;
+        ui.provider_feedback = true;
+        let compact = rendered(&ui, 100, 40);
+        assert!(compact.contains("Solver numerical assessment"));
+        assert!(compact.contains("Use the solver's best action"));
+        assert!(compact.contains("Solver · modeled ranges"));
+        ui.deep = true;
+        let expanded = rendered(&ui, 100, 40);
+        assert!(expanded.contains("SOLVER ANALYSIS"));
+        ui.deep_scroll = 12;
+        let lower = rendered(&ui, 100, 40);
+        assert!(lower.contains("COACHING EXPLANATION"));
+        assert!(lower.contains("Provider coaching details"));
     }
     #[test]
     fn api_key_paste_keeps_x_and_provider() {
@@ -1803,6 +2246,7 @@ mod tests {
             update_note: "installed".into(),
             update_offer: None,
             confirm_install: false,
+            help: false,
         };
         let mut status = String::new();
         let store = FakeStore;
@@ -1852,6 +2296,7 @@ mod tests {
             update_note: "installed".into(),
             update_offer: None,
             confirm_install: false,
+            help: false,
         };
         editor.switch_provider(CoachingMode::Anthropic, "Missing".into());
         assert!(editor.key.is_empty());
@@ -2020,14 +2465,14 @@ mod tests {
         let mut feedback = local_feedback(decision);
         feedback.assessment = "reasonable".into();
         assert_eq!(
-            review_presentation(Some(&feedback), false, false),
+            review_presentation(Some(&feedback), false, false, false, false, false, false),
             (
                 Some(crate::trainer::table_ui::ReviewTone::Good),
                 Some("Local guidance · heuristic")
             )
         );
         assert_eq!(
-            review_presentation(Some(&feedback), false, true),
+            review_presentation(Some(&feedback), false, true, false, false, false, false),
             (
                 Some(crate::trainer::table_ui::ReviewTone::Uncertain),
                 Some("Awaiting provider heuristic")
@@ -2035,12 +2480,12 @@ mod tests {
         );
         feedback.assessment = "reconsider".into();
         assert_eq!(
-            review_presentation(Some(&feedback), false, false).0,
+            review_presentation(Some(&feedback), false, false, false, false, false, false).0,
             Some(crate::trainer::table_ui::ReviewTone::Reconsider)
         );
         feedback.assessment = "uncertain".into();
         assert_eq!(
-            review_presentation(Some(&feedback), true, false),
+            review_presentation(Some(&feedback), true, false, false, false, false, false),
             (
                 Some(crate::trainer::table_ui::ReviewTone::Uncertain),
                 Some("AI suggestion · heuristic")
